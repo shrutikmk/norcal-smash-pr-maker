@@ -26,6 +26,8 @@ web/dist/
 # Real keys live here — see .env.example for variable names only.
 .env
 .env.*
+.env.local
+.env.*.local
 !.env.example
 keys.py
 secrets.json

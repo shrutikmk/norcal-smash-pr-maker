@@ -1,0 +1,9 @@
+# NorCal PR website — Python stack (API in tools/, imports from demo/base_demo/).
+# Install: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+
+requests>=2.28.0
+python-dotenv>=1.0.0
+openai>=1.0.0
+
+# Demo notebook (demo/base_demo/all-functions.ipynb)
+pandas>=2.0.0

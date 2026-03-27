@@ -4,6 +4,8 @@ Dark-themed web app for **Super Smash Bros. Ultimate** NorCal: live **ELO-style 
 
 Stack: **React 19 + Vite** (UI) and a **Python `http.server`** API (`tools/web_api.py`) that talks to start.gg and SQLite caches.
 
+**Repository:** [github.com/shrutikmk/norcal-smash-pr-maker](https://github.com/shrutikmk/norcal-smash-pr-maker)
+
 ---
 
 ## Features
@@ -13,28 +15,29 @@ Stack: **React 19 + Vite** (UI) and a **Python `http.server`** API (`tools/web_a
 | **Home** | All-time or date-range rankings; recent events with job-based loading; optional “resolve coverage gaps” scrape. |
 | **Calendar** | Pick a day (Pacific) or browse “this week”; concluded vs upcoming cards. |
 | **PR Maker** | Quarter shortcuts, ELO-eligible event scrape, selective ingest, merges, OOR-aware comparisons, AI argument (OpenAI), markdown + CSV export. |
-| **Debug** | Header toggle + left log shelf: patched `fetch` logging and verbose page events (persisted via `localStorage`). |
+| **Debug** | Header toggle + left log shelf: client `fetch` logging, server-side events (poll), and page-specific debug lines (`localStorage` for the toggle). |
 
 ---
 
 ## Prerequisites
 
 - **Node.js** 18+ (for Vite)
-- **Python** 3.11+ (3.10+ usually fine)
+- **Python** 3.11+ (3.10+ usually works)
 - **start.gg API token** — create one at [developer.start.gg](https://developer.start.gg/) and set `STARTGG_API_KEY`.
-- **OpenAI API key** — optional; required only for comparison “Generate argument”.
+- **OpenAI API key** — optional; required only for PR Maker “Generate argument”.
 
 ---
 
 ## Setup
 
 ```bash
-# Clone and enter the repo
-cd norcal-pr-website
+git clone https://github.com/shrutikmk/norcal-smash-pr-maker.git
+cd norcal-smash-pr-maker
 
-# Python: use a venv if you like, then install what the demo stack needs.
-# (The API imports from demo/base_demo; install deps your environment is missing,
-#  e.g. requests, python-dotenv — match your existing project practice.)
+# Python (venv recommended)
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 
 # Frontend
 cd web
@@ -47,25 +50,25 @@ npm install
 cp .env.example .env
 ```
 
-Edit **`.env`** at the **repository root** (same folder as this `README.md`). The API loads it via `python-dotenv` from that path.
+Edit **`.env`** at the **repository root** (next to this `README.md`). The API loads it with `python-dotenv` from that path.
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `STARTGG_API_KEY` | **Yes** | All start.gg GraphQL usage. |
 | `OPENAI_API_KEY` | No | PR Maker AI comparison arguments only. |
 
-Never commit `.env`. Use `.env.example` as the template (no secrets).
+Never commit `.env`, `keys.py`, or credential files. See `.gitignore` and `.env.example`.
 
 ---
 
 ## Run locally (development)
 
-You need **two terminals**: API first, then the Vite dev server (which proxies `/api` to the API).
+Use **two terminals**: API first, then the Vite dev server (proxies `/api` to the API).
 
 **Terminal 1 — API (default `http://127.0.0.1:8765`)**
 
 ```bash
-cd norcal-pr-website
+# From repo root (with venv activated)
 python3 tools/web_api.py
 # Optional: python3 tools/web_api.py --host 127.0.0.1 --port 8765
 ```
@@ -73,7 +76,7 @@ python3 tools/web_api.py
 **Terminal 2 — frontend**
 
 ```bash
-cd norcal-pr-website/web
+cd web
 npm run dev
 ```
 
@@ -92,11 +95,12 @@ Serve `web/dist/` with any static host; you must still run the Python API (or pu
 ## Repository layout
 
 ```
-norcal-pr-website/
+norcal-smash-pr-maker/
+├── requirements.txt     # Python deps (API + demo notebook)
 ├── web/                 # React app (Vite)
 ├── tools/               # web_api.py, recent_events helpers, etc.
 ├── demo/base_demo/      # ELO, scraper, processor, start.gg client (imported by API)
-├── data/                # Created at runtime — gitignored (caches, DBs, logs)
+├── data/                # Created at runtime — gitignored (caches, DBs)
 └── .env                 # Local secrets — gitignored
 ```
 
@@ -115,17 +119,15 @@ Runtime artifacts (SQLite DBs, tournament cache, OOR cache, etc.) live under **`
 
 ---
 
-## Security & privacy
+## Security & secrets
 
-- **Do not** commit API keys, `.env`, private keys, or ad-hoc `keys.py` files.
-- The UI never embeds secrets; all privileged calls go through your local API.
-- Review `.gitignore` before pushing; if you add new secret locations, ignore them and rotate any key that was ever committed.
+- **Do not** commit API keys, `.env`, `.env.local`, private keys, ad-hoc `keys.py`, or `credentials.json`.
+- The UI does not embed secrets; privileged calls go through your local API.
+- **`demo/base_demo/all-functions.ipynb`** loads `STARTGG_API_KEY` and `OPENAI_API_KEY` only from the environment or a **repo-root `.env`** (via `python-dotenv`). Do not reintroduce hardcoded tokens or `from keys import …` in tracked files.
 
-### Secret scan (including `demo/`)
+### If a key was ever committed or shared
 
-A pass was done over **`demo/`**, **`tools/`**, and **`web/src`** for hardcoded credentials (Bearer tokens, `AUTH_TOKEN=…`, OpenAI-style keys, `keys.py` imports with literals, etc.). The only hits were **plaintext start.gg tokens** and a **`from keys import …`** line inside **`demo/base_demo/all-functions.ipynb`**. That notebook was **rewritten to use `os.environ["STARTGG_API_KEY"]` / `os.environ.get("STARTGG_API_KEY")` only** (same as the rest of the project). **No new `.gitignore` entries were added for that file** because it no longer contains secrets—it is safe to track.
-
-If that notebook (or any file) was **ever pushed with old tokens**, treat those tokens as **compromised**: revoke/rotate them in the start.gg developer dashboard and rewrite Git history if needed (`git filter-repo`, BFG, etc.) before making the repo public.
+Rotate it in the [start.gg](https://developer.start.gg/) / OpenAI dashboards. For leaked history on GitHub, use history rewriting ([`git filter-repo`](https://github.com/newren/git-filter-repo), BFG, etc.) in addition to rotation.
 
 ---
 
@@ -137,8 +139,8 @@ Add a `LICENSE` file if you open-source this repo; until then, default copyright
 
 ## Contributing
 
-1. Branch from `main` (or your default branch).
+1. Branch from `main`.
 2. Keep PRs focused; match existing formatting in `web/src` and `tools/`.
-3. Run `npm run lint` and smoke-test API + `npm run dev` before opening a PR.
+3. Run `npm run lint` in `web/` and smoke-test the API + `npm run dev` before opening a PR.
 
-For more detail on the Vite/React piece only, see [`web/README.md`](web/README.md).
+More detail on the Vite/React app: [`web/README.md`](web/README.md).
