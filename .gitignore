@@ -1,0 +1,60 @@
+# ── Dependencies ──────────────────────────────────────────
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# ── Build & packaging ─────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+web/dist/
+
+# ── Secrets & credentials (never commit) ───────────────────
+# Real keys live here — see .env.example for variable names only.
+.env
+.env.*
+!.env.example
+keys.py
+secrets.json
+credentials.json
+*.pem
+id_rsa
+id_rsa.pub
+*.key
+.aws/credentials
+
+# ── Local / machine-specific ──────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── App data & caches (generated at runtime) ──────────────
+data/
+backend/data/
+*.db
+cache/
+.cache/
+
+# ── Optional tooling ──────────────────────────────────────
+.eslintcache
