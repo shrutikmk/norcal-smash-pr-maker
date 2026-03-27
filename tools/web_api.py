@@ -44,6 +44,7 @@ try:
         _in_region_tournament_ids, _init_player_db, _build_identity_map_live,
         _get_live_player_report, _upsert_live_player_report, StartGGClient,
         _build_player_opponent_records, CancelledOOR,
+        fetch_oor_tournament_catalog, _fetch_player_sets_by_tournaments,
     )
     from player_ranking import _build_player_card, _build_ai_justification_prompt, _loss_to_tournament_ratio  # type: ignore  # noqa: E402
     import tournament_processor as tp  # type: ignore  # noqa: E402
@@ -160,6 +161,22 @@ def _oor_cache_conn() -> sqlite3.Connection:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS oor_player_sets_cache_v2 (
+            player_id TEXT NOT NULL,
+            window_hash TEXT NOT NULL,
+            nodes_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (player_id, window_hash)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oor_tournament_catalog (
+            window_hash TEXT NOT NULL PRIMARY KEY,
+            tournament_ids_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS oor_tournament_result_cache (
             player_id TEXT NOT NULL,
             tournament_id TEXT NOT NULL,
@@ -191,6 +208,12 @@ def _pr_maker_context_hash(
         ),
     }, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()[:24]
+
+
+def _oor_window_hash(start: str, end: str) -> str:
+    """Stable hash of the PR date window — used as the set-history cache partition."""
+    blob = f"{start}:{end}"
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 def _cache_get_report(conn: sqlite3.Connection, ctx_hash: str, name: str) -> dict[str, Any] | None:
@@ -290,15 +313,30 @@ def _oor_set_fetch_state(
 # Context-independent OOR caches (keyed by player_id, not context_hash)
 # ---------------------------------------------------------------------------
 
-_OOR_SETS_CACHE_TTL = 86400  # 24 hours
+_OOR_SETS_CACHE_TTL = 604800  # 7 days (window-keyed cache; old 24h TTL no longer needed)
 
 
-def _oor_get_player_sets(conn: sqlite3.Connection, player_id: str, ttl_seconds: int = _OOR_SETS_CACHE_TTL) -> tuple[list[dict[str, Any]] | None, int]:
-    """Return (cached_nodes_or_None, fetched_at_unix).  Returns (None, 0) on miss."""
-    row = conn.execute(
-        "SELECT nodes_json, fetched_at FROM oor_player_sets_cache WHERE player_id = ?",
-        (str(player_id),),
-    ).fetchone()
+def _oor_get_player_sets(
+    conn: sqlite3.Connection,
+    player_id: str,
+    window_hash: str = "",
+    ttl_seconds: int = _OOR_SETS_CACHE_TTL,
+) -> tuple[list[dict[str, Any]] | None, int]:
+    """Return (cached_nodes_or_None, fetched_at_unix).  Returns (None, 0) on miss.
+
+    When *window_hash* is provided, looks up the v2 window-keyed table first.
+    Falls back to the legacy table when no window_hash is given (backwards compat).
+    """
+    if window_hash:
+        row = conn.execute(
+            "SELECT nodes_json, fetched_at FROM oor_player_sets_cache_v2 WHERE player_id = ? AND window_hash = ?",
+            (str(player_id), window_hash),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT nodes_json, fetched_at FROM oor_player_sets_cache WHERE player_id = ?",
+            (str(player_id),),
+        ).fetchone()
     if not row:
         return None, 0
     fetched_at = int(row[1])
@@ -310,13 +348,30 @@ def _oor_get_player_sets(conn: sqlite3.Connection, player_id: str, ttl_seconds: 
         return None, 0
 
 
-def _oor_put_player_sets(conn: sqlite3.Connection, player_id: str, nodes: list[dict[str, Any]]) -> None:
+def _oor_put_player_sets(
+    conn: sqlite3.Connection,
+    player_id: str,
+    nodes: list[dict[str, Any]],
+    window_hash: str = "",
+) -> None:
+    now = int(_time.time())
+    nodes_blob = json.dumps(nodes)
+    pid = str(player_id)
+    if window_hash:
+        conn.execute(
+            """INSERT INTO oor_player_sets_cache_v2 (player_id, window_hash, nodes_json, fetched_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(player_id, window_hash)
+               DO UPDATE SET nodes_json = excluded.nodes_json, fetched_at = excluded.fetched_at""",
+            (pid, window_hash, nodes_blob, now),
+        )
+    # Always update legacy table too so non-window-aware code paths stay warm.
     conn.execute(
         """INSERT INTO oor_player_sets_cache (player_id, nodes_json, fetched_at)
            VALUES (?, ?, ?)
            ON CONFLICT(player_id)
            DO UPDATE SET nodes_json = excluded.nodes_json, fetched_at = excluded.fetched_at""",
-        (str(player_id), json.dumps(nodes), int(_time.time())),
+        (pid, nodes_blob, now),
     )
     conn.commit()
 
@@ -371,6 +426,36 @@ def _oor_put_tournament_result(conn: sqlite3.Connection, player_id: str, tournam
             result.get("placement"),
             int(_time.time()),
         ),
+    )
+    conn.commit()
+
+
+_OOR_CATALOG_TTL = 604800  # 7 days
+
+
+def _oor_get_tournament_catalog(conn: sqlite3.Connection, window_hash: str) -> list[str] | None:
+    row = conn.execute(
+        "SELECT tournament_ids_json, fetched_at FROM oor_tournament_catalog WHERE window_hash = ?",
+        (window_hash,),
+    ).fetchone()
+    if not row:
+        return None
+    fetched_at = int(row[1])
+    if int(_time.time()) - fetched_at > _OOR_CATALOG_TTL:
+        return None
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+
+
+def _oor_put_tournament_catalog(conn: sqlite3.Connection, window_hash: str, tournament_ids: list[str]) -> None:
+    conn.execute(
+        """INSERT INTO oor_tournament_catalog (window_hash, tournament_ids_json, fetched_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(window_hash)
+           DO UPDATE SET tournament_ids_json = excluded.tournament_ids_json, fetched_at = excluded.fetched_at""",
+        (window_hash, json.dumps(tournament_ids), int(_time.time())),
     )
     conn.commit()
 
@@ -1074,6 +1159,8 @@ def _load_reports_for_players(
     cfg: EloConfig,
     *,
     ctx_hash: str = "",
+    oor_window_hash: str = "",
+    force_refresh_oor: bool = False,
     progress_cb: Any = None,
     is_warm: bool = False,
     cancel_check: Any = None,
@@ -1081,13 +1168,15 @@ def _load_reports_for_players(
 ) -> dict[str, dict[str, Any]]:
     """Load live reports with SQLite cache + parallel fetching for cache misses.
 
-    ``names``        – iterable of player names; order is preserved for priority.
-    ``ctx_hash``     – if provided, enables the OOR report cache (read/write).
-    ``progress_cb``  – optional ``(completed, total, current_name) -> None``.
-    ``is_warm``      – when True, yields to active pair fetches (lower priority).
-    ``cancel_check`` – optional ``() -> bool``; if returns True, stop early.
-    ``stream_event`` – optional ``(dict) -> None`` for NDJSON progress (must run on request thread;
-                       when set, live fetches run sequentially, not in a thread pool).
+    ``names``             – iterable of player names; order is preserved for priority.
+    ``ctx_hash``          – if provided, enables the OOR report cache (read/write).
+    ``oor_window_hash``   – date-window partition key for the set-history cache (v2).
+    ``force_refresh_oor`` – skip set-history cache reads; overwrite on completion.
+    ``progress_cb``       – optional ``(completed, total, current_name) -> None``.
+    ``is_warm``           – when True, yields to active pair fetches (lower priority).
+    ``cancel_check``      – optional ``() -> bool``; if returns True, stop early.
+    ``stream_event``      – optional ``(dict) -> None`` for NDJSON progress (must run on request thread;
+                            when set, live fetches run sequentially, not in a thread pool).
     """
     names = _dedupe_preserve_order(names)
     token = os.environ.get("STARTGG_API_KEY", "").strip()
@@ -1178,6 +1267,35 @@ def _load_reports_for_players(
         identity = _build_identity_map_live(client, cfg, all_names_for_identity, pdb, verbose=False)
         in_region_ids = _in_region_tournament_ids(cfg.tournament_cache_path)
 
+        # --- Optional M4: tournament catalog for batched player.sets filters ---
+        oor_catalog: list[str] | None = None
+        if cfg.oor_use_tournament_catalog and oor_window_hash and cfg.start_date and cfg.end_date:
+            if cache_conn:
+                try:
+                    oor_catalog = _oor_get_tournament_catalog(cache_conn, oor_window_hash)
+                except Exception:
+                    pass
+            if oor_catalog is None:
+                try:
+                    from elo_calculator import _date_to_unix  # type: ignore
+                    _after = _date_to_unix(cfg.start_date)
+                    _before = _date_to_unix(cfg.end_date)
+                    if _after and _before:
+                        oor_catalog = fetch_oor_tournament_catalog(
+                            client, _after, _before, in_region_ids,
+                            max_retries=cfg.max_retries,
+                        )
+                        if cache_conn and oor_catalog is not None:
+                            with _oor_cache_lock:
+                                _oor_put_tournament_catalog(cache_conn, oor_window_hash, oor_catalog)
+                        server_debug_log(
+                            "info", "server/OOR",
+                            f"Built tournament catalog: {len(oor_catalog or [])} OOR tournament(s) in window",
+                            f"window={oor_window_hash[:8]}",
+                        )
+                except Exception:
+                    oor_catalog = None
+
         if not stream_event:
             _w = 1 if is_warm else 3
             server_debug_log(
@@ -1224,33 +1342,47 @@ def _load_reports_for_players(
                     "player_id": pid,
                 })
 
-            # --- Set history cache (context-independent, keyed by player_id) ---
+            # --- Set history cache (window-keyed v2 when available, fallback to legacy) ---
             preloaded_nodes: list[dict[str, Any]] | None = None
-            if cache_conn:
+            if cache_conn and not force_refresh_oor:
                 try:
-                    cached_nodes, fetched_at = _oor_get_player_sets(cache_conn, pid)
+                    cached_nodes, fetched_at = _oor_get_player_sets(cache_conn, pid, window_hash=oor_window_hash)
                     if cached_nodes is not None:
                         preloaded_nodes = cached_nodes
                         age_min = round((int(_time.time()) - fetched_at) / 60, 1)
+                        _hit_msg = f"Set history CACHE HIT for {player}: {len(cached_nodes)} set node(s) cached (fetched {age_min} min ago)"
+                        server_debug_log("info", "server/OOR", _hit_msg, f"window={oor_window_hash[:8]}" if oor_window_hash else "legacy")
                         if stream_event:
                             stream_event({
                                 "type": "progress",
                                 "phase": "set_history_cache_hit",
                                 "player": player,
-                                "message": f"Set history CACHE HIT for {player}: {len(cached_nodes)} set node(s) cached (fetched {age_min} min ago)",
+                                "message": _hit_msg,
                                 "nodes": len(cached_nodes),
                                 "age_minutes": age_min,
                             })
                     else:
+                        _miss_msg = f"Set history CACHE MISS for {player}: will fetch from Start.gg"
+                        server_debug_log("info", "server/OOR", _miss_msg, f"window={oor_window_hash[:8]}" if oor_window_hash else "legacy")
                         if stream_event:
                             stream_event({
                                 "type": "progress",
                                 "phase": "set_history_cache_miss",
                                 "player": player,
-                                "message": f"Set history CACHE MISS for {player}: will fetch from Start.gg",
+                                "message": _miss_msg,
                             })
                 except Exception:
                     pass
+            elif force_refresh_oor:
+                _fr_msg = f"Force refresh requested for {player}: bypassing set-history cache"
+                server_debug_log("info", "server/OOR", _fr_msg, "")
+                if stream_event:
+                    stream_event({
+                        "type": "progress",
+                        "phase": "set_history_force_refresh",
+                        "player": player,
+                        "message": _fr_msg,
+                    })
 
             # --- Tournament result cache closures (context-independent) ---
             def _tourney_lookup(tournament_id: str) -> dict[str, Any] | None:
@@ -1278,6 +1410,12 @@ def _load_reports_for_players(
                         "player": player,
                         "detail": detail,
                     })
+                if phase == "set_history_fetch_metrics":
+                    server_debug_log(
+                        "info", "server/OOR",
+                        f"Fetch metrics for {player}",
+                        detail.get("message", ""),
+                    )
 
             def _page_cb(page: int, total_pages: int, nodes: list[Any]) -> None:
                 if stream_event:
@@ -1301,10 +1439,11 @@ def _load_reports_for_players(
                     include_raw_player_sets=(preloaded_nodes is None),
                     cancel_check=cancel_check,
                     page_callback=_page_cb if stream_event else None,
-                    phase_callback=_phase_cb if stream_event else None,
+                    phase_callback=_phase_cb,
                     preloaded_set_nodes=preloaded_nodes,
                     tournament_cache_lookup=_tourney_lookup,
                     tournament_cache_store=_tourney_store,
+                    oor_catalog_tournament_ids=oor_catalog if preloaded_nodes is None else None,
                 )
             except CancelledOOR:
                 if stream_event:
@@ -1315,19 +1454,19 @@ def _load_reports_for_players(
                         "message": "OOR fetch stopped between start.gg pages (best-effort cancel)",
                     })
                 return player, _empty_report(player)
-            # Store raw set nodes in context-independent cache if we fetched live
+            # Store raw set nodes in window-keyed cache after a live fetch.
             if preloaded_nodes is None and cache_conn:
                 raw_nodes = report.pop("raw_player_set_nodes", None)
                 if raw_nodes is not None:
                     try:
                         with _oor_cache_lock:
-                            _oor_put_player_sets(cache_conn, pid, raw_nodes)
+                            _oor_put_player_sets(cache_conn, pid, raw_nodes, window_hash=oor_window_hash)
                         if stream_event:
                             stream_event({
                                 "type": "progress",
                                 "phase": "set_history_stored",
                                 "player": player,
-                                "message": f"Stored {len(raw_nodes)} set node(s) for {player} (player_id={pid})",
+                                "message": f"Stored {len(raw_nodes)} set node(s) for {player} (player_id={pid}, window={oor_window_hash[:8]}…)",
                                 "nodes": len(raw_nodes),
                             })
                     except Exception:
@@ -1421,9 +1560,12 @@ def _load_reports_for_players(
 
 def _load_reports_for_pair(
     p1: str, p2: str, sets: list[dict[str, Any]], elo: dict[str, float], cfg: EloConfig,
-    *, ctx_hash: str = "",
+    *, ctx_hash: str = "", oor_window_hash: str = "", force_refresh_oor: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    return _load_reports_for_players([p1, p2], sets, elo, cfg, ctx_hash=ctx_hash)
+    return _load_reports_for_players(
+        [p1, p2], sets, elo, cfg, ctx_hash=ctx_hash,
+        oor_window_hash=oor_window_hash, force_refresh_oor=force_refresh_oor,
+    )
 
 
 def _oor_warm_worker(
@@ -1461,7 +1603,8 @@ def _oor_warm_worker(
                 detail += f" · last: {current_name}"
             server_debug_log("info", "server/OOR-warm", "Progress", detail)
 
-        _load_reports_for_players(names, sets, elo, cfg, ctx_hash=ch, progress_cb=_progress, is_warm=True)
+        wh = _oor_window_hash(start, end)
+        _load_reports_for_players(names, sets, elo, cfg, ctx_hash=ch, oor_window_hash=wh, progress_cb=_progress, is_warm=True)
 
         with JOB_LOCK:
             OOR_WARM_JOBS[job_id].update(status="done", completed=total)
@@ -2347,6 +2490,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                     include_event_slugs=set(event_slugs),
                 )
                 ch = _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules)
+                wh = _oor_window_hash(start_iso, end_iso)
+                force_oor = bool(body.get("forceRefreshOOR", False))
                 use_stream = bool(body.get("stream"))
 
                 if use_stream:
@@ -2364,6 +2509,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                             try:
                                 _load_reports_for_players(
                                     [player], sets, elo, cfg, ctx_hash=ch,
+                                    oor_window_hash=wh, force_refresh_oor=force_oor,
                                     cancel_check=_cancel_ck, stream_event=emit,
                                 )
                                 emit({
@@ -2387,7 +2533,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 with _OOR_ACTIVE_PAIR_LOCK:
                     _OOR_ACTIVE_PAIR.add(player)
                 try:
-                    _load_reports_for_players([player], sets, elo, cfg, ctx_hash=ch, cancel_check=_cancel_ck)
+                    _load_reports_for_players(
+                        [player], sets, elo, cfg, ctx_hash=ch,
+                        oor_window_hash=wh, force_refresh_oor=force_oor,
+                        cancel_check=_cancel_ck,
+                    )
                 finally:
                     with _OOR_ACTIVE_PAIR_LOCK:
                         _OOR_ACTIVE_PAIR.discard(player)
@@ -2438,8 +2588,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     include_event_slugs=set(event_slugs),
                 )
                 ch = _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules)
+                wh = _oor_window_hash(start_iso, end_iso)
+                force_oor = bool(body.get("forceRefreshOOR", False))
                 if include_oor:
-                    reports = _load_reports_for_pair(player_a, player_b, sets, elo, cfg, ctx_hash=ch)
+                    reports = _load_reports_for_pair(
+                        player_a, player_b, sets, elo, cfg,
+                        ctx_hash=ch, oor_window_hash=wh, force_refresh_oor=force_oor,
+                    )
                 else:
                     reports = {
                         player_a: _empty_report(player_a),
@@ -2488,8 +2643,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                     include_event_slugs=set(event_slugs),
                 )
                 ch = _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules)
+                wh = _oor_window_hash(start_iso, end_iso)
                 if bool(body.get("includeOOR", False)):
-                    reports = _load_reports_for_pair(player_a, player_b, sets, elo, cfg, ctx_hash=ch)
+                    reports = _load_reports_for_pair(
+                        player_a, player_b, sets, elo, cfg,
+                        ctx_hash=ch, oor_window_hash=wh,
+                    )
                 else:
                     reports = {
                         player_a: _empty_report(player_a),
@@ -2546,7 +2705,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 names = [str(r.get("name", "")) for r in ranking]
                 copeland_map = {str(r.get("name", "")): r.get("copelandScore", 0) for r in ranking}
                 ch = _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules)
-                reports = _load_reports_for_players(names, sets, elo, cfg, ctx_hash=ch)
+                wh = _oor_window_hash(start_iso, end_iso)
+                reports = _load_reports_for_players(names, sets, elo, cfg, ctx_hash=ch, oor_window_hash=wh)
                 server_debug_log(
                     "info", "server/CSV",
                     "final-export complete",
@@ -2594,9 +2754,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                     include_event_slugs=set(event_slugs),
                 )
                 ch = _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules)
+                wh = _oor_window_hash(start_iso, end_iso)
                 sorted_names = sorted(names, key=lambda n: elo.get(n, cfg.initial_elo), reverse=True)
                 copeland_pool = _pool_copeland_scores(sorted_names, sets)
-                reports = _load_reports_for_players(sorted_names, sets, elo, cfg, ctx_hash=ch)
+                reports = _load_reports_for_players(sorted_names, sets, elo, cfg, ctx_hash=ch, oor_window_hash=wh)
                 server_debug_log(
                     "info", "server/CSV",
                     "candidates-export complete",

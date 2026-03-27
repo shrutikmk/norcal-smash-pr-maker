@@ -194,6 +194,72 @@ query EventStandings($eventId: ID!, $page: Int!, $perPage: Int!) {
 }
 """
 
+PLAYER_SETS_FILTERED_QUERY = """
+query PlayerSetsFiltered($playerId: ID!, $page: Int!, $perPage: Int!, $tournamentIds: [ID]) {
+  player(id: $playerId) {
+    id
+    sets(page: $page, perPage: $perPage, filters: { tournamentIds: $tournamentIds }) {
+      pageInfo { totalPages page perPage }
+      nodes {
+        id
+        event {
+          id
+          slug
+          name
+          tournament {
+            id
+            slug
+            name
+            startAt
+          }
+        }
+        slots {
+          entrant {
+            participants {
+              gamerTag
+              prefix
+              user { id }
+              player { id }
+            }
+          }
+          standing {
+            stats {
+              score { value }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+TOURNAMENTS_BY_GAME_DATE_QUERY = """
+query TournamentsByGameDate($page: Int!, $perPage: Int!, $afterDate: Timestamp!, $beforeDate: Timestamp!, $videogameIds: [ID]!) {
+  tournaments(
+    query: {
+      page: $page
+      perPage: $perPage
+      filter: {
+        afterDate: $afterDate
+        beforeDate: $beforeDate
+        videogameIds: $videogameIds
+        past: true
+      }
+      sortBy: "startAt"
+    }
+  ) {
+    pageInfo { totalPages page }
+    nodes {
+      id
+      name
+      slug
+      startAt
+    }
+  }
+}
+"""
+
 
 @dataclass
 class EloConfig:
@@ -212,6 +278,8 @@ class EloConfig:
     per_page: int = 50  # capped to MAX_OBJECTS_PER_REQUEST // 10 when making API calls
     max_retries: int = 5
     max_out_region_tournaments: int | None = 20
+    oor_early_stop_player_sets: bool = False
+    oor_use_tournament_catalog: bool = False
 
 
 class RateLimiter:
@@ -1330,12 +1398,26 @@ def _fetch_player_sets_live(
     *,
     cancel_check: Any = None,
     page_callback: Any = None,
+    pr_window_start_unix: int | None = None,
+    metrics_out: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch all set nodes for a player. Supports cooperative cancellation between pages
-    and an optional ``page_callback(page, total_pages, nodes_this_page)`` for incremental storage."""
+    """Fetch set nodes for a player with cooperative cancellation and optional early-stop.
+
+    When *pr_window_start_unix* is set, pagination stops early if **every** node on a
+    page has ``event.tournament.startAt`` strictly before that timestamp.  This avoids
+    fetching deep career history when the API returns sets in reverse-chronological order
+    (observed default for ``player.sets``).  If any node on a page is missing ``startAt``,
+    early-stop is suppressed for that page to avoid data loss.
+
+    When *metrics_out* is provided (mutable dict), the function populates it with:
+    ``pages_fetched``, ``total_pages``, ``early_stop``, ``wall_ms``.
+    """
+    t0 = time.monotonic()
     nodes_all: list[dict[str, Any]] = []
     current_per_page = min(per_page, PLAYER_SETS_PER_PAGE)
     page = 1
+    early_stopped = False
+    last_total_pages = 1
     while True:
         if cancel_check and cancel_check():
             raise CancelledOOR(f"Cancelled before page {page}")
@@ -1350,17 +1432,143 @@ def _fetch_player_sets_live(
                 current_per_page = max(5, current_per_page // 2)
                 nodes_all = []
                 page = 1
+                early_stopped = False
                 continue
             raise
         sets_conn = payload.get("data", {}).get("player", {}).get("sets", {})
         nodes = sets_conn.get("nodes", []) or []
         nodes_all.extend(nodes)
-        total_pages = sets_conn.get("pageInfo", {}).get("totalPages", 1)
+        last_total_pages = sets_conn.get("pageInfo", {}).get("totalPages", 1)
         if page_callback:
-            page_callback(page, total_pages, nodes)
+            page_callback(page, last_total_pages, nodes)
+        if page >= last_total_pages:
+            break
+
+        # Early-stop: if every node on this page predates the PR window, remaining
+        # pages are even older and can be skipped.
+        if pr_window_start_unix is not None and nodes:
+            start_ats = []
+            for n in nodes:
+                sa = ((n.get("event") or {}).get("tournament") or {}).get("startAt")
+                if sa is not None:
+                    start_ats.append(int(sa))
+            if start_ats and len(start_ats) == len(nodes) and max(start_ats) < pr_window_start_unix:
+                early_stopped = True
+                break
+
+        page += 1
+
+    if metrics_out is not None:
+        metrics_out["pages_fetched"] = page
+        metrics_out["total_pages"] = last_total_pages
+        metrics_out["early_stop"] = early_stopped
+        metrics_out["wall_ms"] = round((time.monotonic() - t0) * 1000)
+    return nodes_all
+
+
+# --- M4: Tournament catalog + batched tournamentIds filter ---
+
+OOR_CATALOG_CHUNK_SIZE = 25
+
+
+def fetch_oor_tournament_catalog(
+    client: StartGGClient,
+    after_unix: int,
+    before_unix: int,
+    in_region_tournament_ids: set[str],
+    *,
+    videogame_ids: list[int] | None = None,
+    max_retries: int = 5,
+    per_page: int = 50,
+) -> list[str]:
+    """Return tournament IDs in [after, before] that are NOT in-region.
+
+    Paginates ``tournaments`` with ``afterDate / beforeDate / videogameIds`` and subtracts
+    *in_region_tournament_ids*.
+    """
+    vids = videogame_ids or [SMASH_ULTIMATE_VIDEOGAME_ID]
+    all_ids: list[str] = []
+    page = 1
+    while True:
+        payload = client.gql(
+            TOURNAMENTS_BY_GAME_DATE_QUERY,
+            {
+                "page": page,
+                "perPage": per_page,
+                "afterDate": after_unix,
+                "beforeDate": before_unix,
+                "videogameIds": [str(v) for v in vids],
+            },
+            max_retries=max_retries,
+        )
+        tourney_conn = payload.get("data", {}).get("tournaments", {})
+        nodes = tourney_conn.get("nodes", []) or []
+        for n in nodes:
+            tid = str(n.get("id") or "")
+            if tid and tid not in in_region_tournament_ids:
+                all_ids.append(tid)
+        total_pages = tourney_conn.get("pageInfo", {}).get("totalPages", 1)
         if page >= total_pages:
             break
         page += 1
+    return all_ids
+
+
+def _fetch_player_sets_by_tournaments(
+    client: StartGGClient,
+    player_id: str,
+    tournament_ids: list[str],
+    per_page: int,
+    max_retries: int,
+    *,
+    cancel_check: Any = None,
+    metrics_out: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch a player's sets restricted to a known set of tournament IDs (chunked).
+
+    Uses ``PLAYER_SETS_FILTERED_QUERY`` with ``filters: { tournamentIds }`` to avoid
+    full-career pagination.
+    """
+    t0 = time.monotonic()
+    nodes_all: list[dict[str, Any]] = []
+    pages_total = 0
+    current_per_page = min(per_page, PLAYER_SETS_PER_PAGE)
+    for i in range(0, len(tournament_ids), OOR_CATALOG_CHUNK_SIZE):
+        chunk = tournament_ids[i : i + OOR_CATALOG_CHUNK_SIZE]
+        page = 1
+        while True:
+            if cancel_check and cancel_check():
+                raise CancelledOOR("Cancelled during filtered set fetch")
+            try:
+                payload = client.gql(
+                    PLAYER_SETS_FILTERED_QUERY,
+                    {
+                        "playerId": str(player_id),
+                        "page": page,
+                        "perPage": current_per_page,
+                        "tournamentIds": chunk,
+                    },
+                    max_retries=max_retries,
+                )
+            except RuntimeError as e:
+                if "complexity limit exceeded" in str(e).lower() and current_per_page > 5:
+                    current_per_page = max(5, current_per_page // 2)
+                    continue
+                raise
+            sets_conn = payload.get("data", {}).get("player", {}).get("sets", {})
+            nodes = sets_conn.get("nodes", []) or []
+            nodes_all.extend(nodes)
+            total_pages = sets_conn.get("pageInfo", {}).get("totalPages", 1)
+            pages_total += 1
+            if page >= total_pages:
+                break
+            page += 1
+    if metrics_out is not None:
+        metrics_out["pages_fetched"] = pages_total
+        metrics_out["total_pages"] = pages_total
+        metrics_out["early_stop"] = False
+        metrics_out["wall_ms"] = round((time.monotonic() - t0) * 1000)
+        metrics_out["catalog_chunks"] = (len(tournament_ids) + OOR_CATALOG_CHUNK_SIZE - 1) // OOR_CATALOG_CHUNK_SIZE
     return nodes_all
 
 
@@ -1407,6 +1615,7 @@ def _get_live_player_report(
     preloaded_set_nodes: list[dict[str, Any]] | None = None,
     tournament_cache_lookup: Any = None,
     tournament_cache_store: Any = None,
+    oor_catalog_tournament_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     player_sets = [s for s in in_region_sets if s["p1"] == canonical_name or s["p2"] == canonical_name]
     in_wins = in_losses = 0
@@ -1495,18 +1704,55 @@ def _get_live_player_report(
                 },
             )
     else:
-        if phase_callback:
+        _fetch_metrics: dict[str, Any] = {}
+        if oor_catalog_tournament_ids is not None:
+            if phase_callback:
+                phase_callback(
+                    "set_history_cache_miss",
+                    {
+                        "canonical_name": canonical_name,
+                        "message": f"Fetching sets via tournament catalog ({len(oor_catalog_tournament_ids)} OOR tournament(s))",
+                    },
+                )
+            player_set_nodes = _fetch_player_sets_by_tournaments(
+                client, player_id, oor_catalog_tournament_ids,
+                config.per_page, config.max_retries,
+                cancel_check=cancel_check,
+                metrics_out=_fetch_metrics,
+            )
+        else:
+            if phase_callback:
+                phase_callback(
+                    "set_history_cache_miss",
+                    {
+                        "canonical_name": canonical_name,
+                        "message": "Set history CACHE MISS: fetching full set history (paginated) from Start.gg",
+                    },
+                )
+            _early_stop_ts: int | None = None
+            if config.oor_early_stop_player_sets and config.start_date:
+                _early_stop_ts = _date_to_unix(config.start_date)
+            player_set_nodes = _fetch_player_sets_live(
+                client, player_id, config.per_page, config.max_retries,
+                cancel_check=cancel_check, page_callback=page_callback,
+                pr_window_start_unix=_early_stop_ts,
+                metrics_out=_fetch_metrics,
+            )
+        if phase_callback and _fetch_metrics:
+            _method = "catalog" if oor_catalog_tournament_ids is not None else "paginated"
             phase_callback(
-                "set_history_cache_miss",
+                "set_history_fetch_metrics",
                 {
                     "canonical_name": canonical_name,
-                    "message": "Set history CACHE MISS: fetching full set history (paginated) from Start.gg",
+                    "message": (
+                        f"Fetched {_fetch_metrics.get('pages_fetched', '?')}/{_fetch_metrics.get('total_pages', '?')} page(s) "
+                        f"in {_fetch_metrics.get('wall_ms', '?')}ms ({_method})"
+                        f"{' (early-stop)' if _fetch_metrics.get('early_stop') else ''}"
+                    ),
+                    **_fetch_metrics,
+                    "method": _method,
                 },
             )
-        player_set_nodes = _fetch_player_sets_live(
-            client, player_id, config.per_page, config.max_retries,
-            cancel_check=cancel_check, page_callback=page_callback,
-        )
     after = _date_to_unix(config.start_date) if config.start_date else None
     before = _date_to_unix(config.end_date) if config.end_date else None
 
