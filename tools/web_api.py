@@ -460,6 +460,42 @@ def _oor_put_tournament_catalog(conn: sqlite3.Connection, window_hash: str, tour
     conn.commit()
 
 
+def _dq_filtered_attendance_counts(sets: list[dict[str, Any]]) -> dict[str, int]:
+    """Per player: distinct tournament_ids with at least one non-DQ set (player score != -1)."""
+    attendance: dict[str, dict[str, bool]] = {}
+    for s in sets:
+        tid = str(s.get("tournament_id") or "").strip()
+        if not tid:
+            continue
+        for p in (s["p1"], s["p2"]):
+            player_tourns = attendance.setdefault(p, {})
+            is_dq = (s["p1_score"] == -1) if p == s["p1"] else (s["p2_score"] == -1)
+            prev = player_tourns.get(tid)
+            if prev is None:
+                player_tourns[tid] = not is_dq
+            elif not prev:
+                player_tourns[tid] = not is_dq
+    return {p: sum(1 for v in d.values() if v) for p, d in attendance.items()}
+
+
+def _dq_filtered_in_region_tournament_count(player_sets: list[dict[str, Any]], name: str) -> int:
+    """Count tournaments where `name` has at least one non-DQ set (DQ = that player's score is -1)."""
+    flags: dict[str, bool] = {}
+    for s in player_sets:
+        if s["p1"] != name and s["p2"] != name:
+            continue
+        tid = str(s.get("tournament_id") or "").strip()
+        if not tid:
+            continue
+        is_dq = (s["p1_score"] == -1) if s["p1"] == name else (s["p2_score"] == -1)
+        prev = flags.get(tid)
+        if prev is None:
+            flags[tid] = not is_dq
+        elif not prev:
+            flags[tid] = not is_dq
+    return sum(1 for v in flags.values() if v)
+
+
 def _oor_rebuild_report_from_rows(
     conn: sqlite3.Connection,
     ctx_hash: str,
@@ -468,10 +504,9 @@ def _oor_rebuild_report_from_rows(
 ) -> dict[str, Any]:
     """Reconstruct a full report dict from granular oor_event_row + in-region sets."""
     player_sets = [s for s in in_region_sets if s["p1"] == name or s["p2"] == name]
-    in_events: set[str] = set()
+    in_region_tournament_count = _dq_filtered_in_region_tournament_count(player_sets, name)
     in_wins = in_losses = 0
     for s in player_sets:
-        in_events.add(s["event_slug"])
         if (s["p1"] == name and s["p1_score"] > s["p2_score"]) or \
            (s["p2"] == name and s["p2_score"] > s["p1_score"]):
             in_wins += 1
@@ -535,7 +570,7 @@ def _oor_rebuild_report_from_rows(
 
     return {
         "canonical_name": name,
-        "in_region_tournaments": len(in_events),
+        "in_region_tournaments": in_region_tournament_count,
         "in_region_wins": in_wins,
         "in_region_losses": in_losses,
         "in_region_placements": in_region_placements,
@@ -2399,16 +2434,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     self._write_json(400, {"error": "eventSlugs list is required"})
                     return
                 sets, elo = _pr_maker_merged_sets_and_elo(start_iso, end_iso, event_slugs, merge_rules)
-                attendance: dict[str, set[str]] = {}
-                for s in sets:
-                    for p in (s["p1"], s["p2"]):
-                        attendance.setdefault(p, set()).add(s.get("event_slug", ""))
+                attendance = _dq_filtered_attendance_counts(sets)
                 players = []
                 for name in elo:
                     players.append({
                         "name": name,
                         "elo": round(elo[name], 2),
-                        "attendance": len(attendance.get(name, set())),
+                        "attendance": attendance.get(name, 0),
                     })
                 self._write_json(200, {"players": players})
                 return
@@ -2808,6 +2840,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "phase": "queued",
                         "currentEvent": 0,
                         "totalEvents": len(slugs),
+                        "eventSlugs": list(slugs),
                         "currentEventName": "",
                         "progressPct": 0,
                         "currentEventSets": 0,

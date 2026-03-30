@@ -38,6 +38,86 @@ function sortEvents(events, sortOrder) {
   })
 }
 
+function normalizeTournamentId(ev) {
+  return String(ev.tournamentId || '').trim()
+}
+
+/** Split events: same start.gg tournament (non-empty id) with 2+ eligible rows → duplicates pool. */
+function partitionEventsByTournament(events) {
+  const counts = new Map()
+  for (const ev of events) {
+    const tid = normalizeTournamentId(ev)
+    if (!tid) continue
+    counts.set(tid, (counts.get(tid) || 0) + 1)
+  }
+  const singletons = []
+  const duplicates = []
+  for (const ev of events) {
+    const tid = normalizeTournamentId(ev)
+    if (!tid || (counts.get(tid) || 0) < 2) {
+      singletons.push(ev)
+    } else {
+      duplicates.push(ev)
+    }
+  }
+  const duplicateTournamentCount = [...counts.values()].filter((n) => n >= 2).length
+  return { singletons, duplicates, duplicateTournamentCount }
+}
+
+/** Group duplicate events by tournament, sort groups by date then name; sort inside each group by user sort order. */
+function buildDuplicateGroupsSorted(duplicates, sortOrder) {
+  const byTid = new Map()
+  for (const ev of duplicates) {
+    const tid = normalizeTournamentId(ev)
+    if (!byTid.has(tid)) byTid.set(tid, [])
+    byTid.get(tid).push(ev)
+  }
+  const groups = [...byTid.values()].map((g) => sortEvents(g, sortOrder))
+  groups.sort((a, b) => {
+    const aMin = Math.min(...a.map((e) => e.startAt || 0))
+    const bMin = Math.min(...b.map((e) => e.startAt || 0))
+    if (aMin !== bMin) return aMin - bMin
+    return (a[0]?.tournamentName || '').localeCompare(b[0]?.tournamentName || '')
+  })
+  return groups
+}
+
+function ProcessEventRow({ ev, checked, onToggle, duplicateSection }) {
+  const showBracket =
+    duplicateSection &&
+    ev.eventName &&
+    ev.eventName !== '(unknown event)'
+  return (
+    <li
+      className={`process-event-row${duplicateSection ? ' process-event-row--duplicate' : ''}`}
+    >
+      <label className="process-event-checkbox-wrap">
+        <input
+          type="checkbox"
+          className="process-event-checkbox"
+          checked={checked}
+          onChange={() => onToggle(ev.eventSlug)}
+        />
+        <span className="process-checkbox-visual" aria-hidden="true" />
+      </label>
+      <a
+        className={`process-event-card${checked ? '' : ' process-event-card--unchecked'}`}
+        href={ev.eventLink}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        <span className="process-event-title">{ev.title}</span>
+        <span className="process-event-meta">
+          {fmtDatePacific(ev.date)} · {ev.entrantCount} entrant{ev.entrantCount === 1 ? '' : 's'}
+        </span>
+        {showBracket ? (
+          <span className="process-event-meta process-event-meta--bracket">{ev.eventName}</span>
+        ) : null}
+      </a>
+    </li>
+  )
+}
+
 export default function PRMakerProcessPage() {
   const dlog = useDebugLog()
   const [searchParams] = useSearchParams()
@@ -163,11 +243,26 @@ export default function PRMakerProcessPage() {
     dragOverIdx.current = null
   }
 
-  const sorted = useMemo(() => sortEvents(events, sortOrder), [events, sortOrder])
+  const { singletonSorted, duplicateGroups, duplicateSortedFlat, duplicateTournamentCount, displayOrderForIngest } =
+    useMemo(() => {
+      const { singletons, duplicates, duplicateTournamentCount: dtc } = partitionEventsByTournament(events)
+      const singletonSortedInner = sortEvents(singletons, sortOrder)
+      const duplicateGroupsInner = buildDuplicateGroupsSorted(duplicates, sortOrder)
+      const duplicateSortedFlatInner = duplicateGroupsInner.flat()
+      return {
+        singletonSorted: singletonSortedInner,
+        duplicateGroups: duplicateGroupsInner,
+        duplicateSortedFlat: duplicateSortedFlatInner,
+        duplicateTournamentCount: dtc,
+        displayOrderForIngest: [...singletonSortedInner, ...duplicateSortedFlatInner],
+      }
+    }, [events, sortOrder])
   const selectedCount = selected.size
 
   async function startIngestion() {
-    const slugs = sorted.filter((e) => selected.has(e.eventSlug)).map((e) => e.eventSlug)
+    const slugs = displayOrderForIngest
+      .filter((e) => selected.has(e.eventSlug))
+      .map((e) => e.eventSlug)
     if (!slugs.length) return
     dlog('info', 'PRMaker/Process', `Starting ingestion — ${slugs.length} events selected`)
     setLastIngestSlugs(slugs)
@@ -189,10 +284,27 @@ export default function PRMakerProcessPage() {
   }
 
   function handleProceed() {
-    dlog('info', 'PRMaker/Process', `Proceeding to candidates with ${lastIngestSlugs.length} event slugs`)
-    const ctx = { startDate, endDate, eventSlugs: lastIngestSlugs }
-    try { sessionStorage.setItem('prMakerCandidatesContext', JSON.stringify(ctx)) } catch {}
-    navigate('/pr-maker/candidates', { state: ctx })
+    const authoritative =
+      isDone &&
+      processStatus &&
+      Array.isArray(processStatus.eventSlugs) &&
+      processStatus.eventSlugs.length > 0
+        ? processStatus.eventSlugs
+        : lastIngestSlugs
+    dlog('info', 'PRMaker/Process', `Proceeding to candidates with ${authoritative.length} event slug(s) (from ${processStatus?.eventSlugs?.length ? 'completed job' : 'client ingest list'})`)
+    const stored = {
+      startDate,
+      endDate,
+      eventSlugs: authoritative,
+      savedAt: Date.now(),
+    }
+    try {
+      sessionStorage.setItem('prMakerCandidatesContext', JSON.stringify(stored))
+      sessionStorage.setItem(`prMakerCandidates_${startDate}_${endDate}`, JSON.stringify(stored))
+    } catch { /* ignore quota / private mode */ }
+    navigate('/pr-maker/candidates', {
+      state: { startDate, endDate, eventSlugs: authoritative },
+    })
   }
 
   const isProcessing = processStatus && processStatus.status === 'running'
@@ -233,6 +345,9 @@ export default function PRMakerProcessPage() {
                 <div className="process-events-toolbar">
                   <span className="process-events-count">
                     {events.length} event{events.length === 1 ? '' : 's'} · {selectedCount} selected
+                    {duplicateTournamentCount > 0
+                      ? ` · ${duplicateTournamentCount} tournament${duplicateTournamentCount === 1 ? '' : 's'} with multiple events`
+                      : ''}
                   </span>
                   <div className="process-events-bulk">
                     <button type="button" className="process-bulk-btn" onClick={selectAll}>
@@ -245,34 +360,49 @@ export default function PRMakerProcessPage() {
                 </div>
 
                 <ul className="process-event-list">
-                  {sorted.map((ev) => {
-                    const checked = selected.has(ev.eventSlug)
-                    return (
-                      <li key={ev.eventSlug} className="process-event-row">
-                        <label className="process-event-checkbox-wrap">
-                          <input
-                            type="checkbox"
-                            className="process-event-checkbox"
-                            checked={checked}
-                            onChange={() => toggleEvent(ev.eventSlug)}
-                          />
-                          <span className="process-checkbox-visual" aria-hidden="true" />
-                        </label>
-                        <a
-                          className={`process-event-card${checked ? '' : ' process-event-card--unchecked'}`}
-                          href={ev.eventLink}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                        >
-                          <span className="process-event-title">{ev.title}</span>
-                          <span className="process-event-meta">
-                            {fmtDatePacific(ev.date)} · {ev.entrantCount} entrant{ev.entrantCount === 1 ? '' : 's'}
-                          </span>
-                        </a>
-                      </li>
-                    )
-                  })}
+                  {singletonSorted.map((ev) => (
+                    <ProcessEventRow
+                      key={ev.eventSlug}
+                      ev={ev}
+                      checked={selected.has(ev.eventSlug)}
+                      onToggle={toggleEvent}
+                      duplicateSection={false}
+                    />
+                  ))}
                 </ul>
+
+                {duplicateSortedFlat.length > 0 ? (
+                  <div className="process-duplicate-section">
+                    <div className="process-events-divider" role="separator" />
+                    <h3 className="process-duplicate-heading">Same tournament, multiple events</h3>
+                    <p className="process-duplicate-hint">
+                      These brackets share one start.gg tournament. Uncheck any you do not want ingested (e.g. ladder vs singles).
+                    </p>
+                    <ul className="process-event-list process-event-list--duplicates">
+                      {duplicateGroups.flatMap((group) => {
+                        const tid = normalizeTournamentId(group[0])
+                        const tname = group[0]?.tournamentName || 'Tournament'
+                        return [
+                          <li key={`dup-head-${tid}`} className="process-duplicate-group-head">
+                            <span className="process-duplicate-group-title">{tname}</span>
+                            <span className="process-duplicate-group-count">
+                              {group.length} event{group.length === 1 ? '' : 's'}
+                            </span>
+                          </li>,
+                          ...group.map((ev) => (
+                            <ProcessEventRow
+                              key={ev.eventSlug}
+                              ev={ev}
+                              checked={selected.has(ev.eventSlug)}
+                              onToggle={toggleEvent}
+                              duplicateSection
+                            />
+                          )),
+                        ]
+                      })}
+                    </ul>
+                  </div>
+                ) : null}
               </section>
 
               <aside className="process-filters-section">

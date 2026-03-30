@@ -13,15 +13,45 @@ const COLUMN_GROUPS = [
   { id: 'placement', label: 'Rank / Copeland', columns: ['rank', 'copeland_score'] },
 ]
 
+function readPrMakerContextFromSessionStorage() {
+  try {
+    let best = null
+    let bestTs = -1
+    for (let i = 0; i < sessionStorage.length; i += 1) {
+      const k = sessionStorage.key(i)
+      if (!k || !k.startsWith('prMakerCandidates')) continue
+      const raw = sessionStorage.getItem(k)
+      if (!raw) continue
+      const p = JSON.parse(raw)
+      if (!p?.startDate || !p?.endDate || !Array.isArray(p.eventSlugs) || p.eventSlugs.length === 0) {
+        continue
+      }
+      const ts = typeof p.savedAt === 'number' ? p.savedAt : 0
+      if (ts >= bestTs) {
+        bestTs = ts
+        best = p
+      }
+    }
+    if (best) {
+      return {
+        startDate: best.startDate,
+        endDate: best.endDate,
+        eventSlugs: best.eventSlugs,
+      }
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
 function getContext(locationState) {
   if (locationState?.startDate && locationState?.endDate && locationState?.eventSlugs?.length) {
-    return locationState
+    return {
+      startDate: locationState.startDate,
+      endDate: locationState.endDate,
+      eventSlugs: locationState.eventSlugs,
+    }
   }
-  try {
-    const raw = sessionStorage.getItem('prMakerCandidatesContext')
-    if (raw) return JSON.parse(raw)
-  } catch {}
-  return null
+  return readPrMakerContextFromSessionStorage()
 }
 
 export default function PRMakerCandidatesPage() {
@@ -356,6 +386,12 @@ export default function PRMakerCandidatesPage() {
           <header className="process-header">
             <h2 className="panel-title">PR Maker</h2>
             <p className="process-subtitle">Candidate Selection</p>
+            <p className="candidates-scope-hint" title="Matches POST /api/pr-maker/candidates eventSlugs — attendance and ELO use only these events.">
+              ELO / attendance scope:{' '}
+              <strong>{ctx.eventSlugs.length}</strong> event{ctx.eventSlugs.length === 1 ? '' : 's'} selected for ingest
+              {' · '}
+              {ctx.startDate} — {ctx.endDate}
+            </p>
           </header>
 
           {loading && players.length === 0 ? (
@@ -391,6 +427,7 @@ export default function PRMakerCandidatesPage() {
                           <button
                             type="button"
                             className="candidates-att-btn"
+                            title="Distinct NorCal tournaments in the selected season (start.gg tournament ID). Multiple brackets at the same tournament count once."
                             onClick={() => setShowAttendancePopover((v) => !v)}
                           >
                             Attendance
@@ -398,6 +435,9 @@ export default function PRMakerCandidatesPage() {
                           </button>
                           {showAttendancePopover ? (
                             <div className="candidates-att-popover">
+                              <p className="candidates-att-popover-hint">
+                                Counts distinct in-region tournaments only (not each bracket). Singles and doubles at the same local count as one.
+                              </p>
                               <label className="candidates-att-popover-label">
                                 Minimum tournaments
                                 <input

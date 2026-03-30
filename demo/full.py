@@ -137,7 +137,7 @@ def run_full_pipeline(args: argparse.Namespace) -> None:
     _stage_banner("[STAGE 3/4] elo_calculator.py")
     elo_cfg = EloConfig(
         start_date=args.start,
-        end_date=args.end,
+        end_date=args.end,  
         max_out_region_tournaments=args.max_oor_tournaments,
     )
     run_demo(elo_cfg, verbose=not args.quiet)

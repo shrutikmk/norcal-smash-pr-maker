@@ -1598,6 +1598,24 @@ def _fetch_event_placement_for_player_live(
     return None
 
 
+def _dq_filtered_in_region_tournament_count(player_sets: list[dict[str, Any]], name: str) -> int:
+    """Count tournaments where `name` has at least one non-DQ set (DQ = that player's score is -1)."""
+    flags: dict[str, bool] = {}
+    for s in player_sets:
+        if s["p1"] != name and s["p2"] != name:
+            continue
+        tid = str(s.get("tournament_id") or "").strip()
+        if not tid:
+            continue
+        is_dq = (s["p1_score"] == -1) if s["p1"] == name else (s["p2_score"] == -1)
+        prev = flags.get(tid)
+        if prev is None:
+            flags[tid] = not is_dq
+        elif not prev:
+            flags[tid] = not is_dq
+    return sum(1 for v in flags.values() if v)
+
+
 def _get_live_player_report(
     *,
     client: StartGGClient,
@@ -1619,10 +1637,9 @@ def _get_live_player_report(
 ) -> dict[str, Any]:
     player_sets = [s for s in in_region_sets if s["p1"] == canonical_name or s["p2"] == canonical_name]
     in_wins = in_losses = 0
-    in_events = set()
+    in_region_tournament_count = _dq_filtered_in_region_tournament_count(player_sets, canonical_name)
     in_event_meta: dict[str, dict[str, Any]] = {}
     for s in player_sets:
-        in_events.add(s["event_slug"])
         if s["event_slug"] not in in_event_meta:
             in_event_meta[s["event_slug"]] = {
                 "event_id": s.get("event_id", ""),
@@ -1989,7 +2006,7 @@ def _get_live_player_report(
     report = {
         "canonical_name": canonical_name,
         "user_id": user_id,
-        "in_region_tournaments": len(in_events),
+        "in_region_tournaments": in_region_tournament_count,
         "in_region_wins": in_wins,
         "in_region_losses": in_losses,
         "in_region_placements": in_region_placements,
