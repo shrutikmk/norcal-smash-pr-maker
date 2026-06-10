@@ -3,6 +3,11 @@ import { useDebugLog } from '../debug/DebugContext.jsx'
 
 const INITIAL_VISIBLE = 10
 const PAGE_SIZE = 10
+const SEARCH_DEBOUNCE_MS = 180
+
+// Module-level stale-while-revalidate cache: navigating back to Home renders the
+// last ELO payload instantly while a background refetch updates it.
+let homeEloCache = null
 
 function fmtDate(dateStr) {
   if (!dateStr) {
@@ -32,9 +37,10 @@ export default function HomePage() {
   const [mode, setMode] = useState('all-time')
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
+  const [searchInput, setSearchInput] = useState('')
   const [search, setSearch] = useState('')
-  const [eloData, setEloData] = useState([])
-  const [missingRanges, setMissingRanges] = useState([])
+  const [eloData, setEloData] = useState(() => homeEloCache?.rankings || [])
+  const [missingRanges, setMissingRanges] = useState(() => homeEloCache?.missingRanges || [])
   const [eloLoading, setEloLoading] = useState(false)
   const [eloError, setEloError] = useState('')
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE)
@@ -65,6 +71,7 @@ export default function HomePage() {
         throw new Error(data.error || 'Failed to load ELO rankings')
       }
       dlog('info', 'Home', `refreshAllTimeElo done — ${(data.rankings || []).length} players, ${(data.missingRanges || []).length} missing ranges`)
+      homeEloCache = { rankings: data.rankings || [], missingRanges: data.missingRanges || [] }
       setMode('all-time')
       setEloData(data.rankings || [])
       setMissingRanges(data.missingRanges || [])
@@ -139,8 +146,13 @@ export default function HomePage() {
   useEffect(() => {
     let cancelled = false
     async function loadAllTimeElo() {
-      dlog('info', 'Home', 'Mount — loading initial all-time ELO')
-      setEloLoading(true)
+      const haveCache = !!homeEloCache
+      dlog('info', 'Home', haveCache
+        ? 'Mount — cached ELO shown, revalidating in background'
+        : 'Mount — loading initial all-time ELO')
+      // Only show the loading state on a cold cache; otherwise the cached table
+      // stays visible while the background refetch lands.
+      if (!haveCache) setEloLoading(true)
       setEloError('')
       try {
         const res = await fetch(buildEloUrl('all-time', null, null))
@@ -150,10 +162,11 @@ export default function HomePage() {
         }
         if (!cancelled) {
           dlog('info', 'Home', `Initial ELO loaded — ${(data.rankings || []).length} players`)
+          homeEloCache = { rankings: data.rankings || [], missingRanges: data.missingRanges || [] }
           setMode('all-time')
-          setEloData(data.rankings || [])
-          setMissingRanges(data.missingRanges || [])
-          setVisibleCount(INITIAL_VISIBLE)
+          setEloData(homeEloCache.rankings)
+          setMissingRanges(homeEloCache.missingRanges)
+          if (!haveCache) setVisibleCount(INITIAL_VISIBLE)
           setCoverageDetail('')
         }
       } catch (err) {
@@ -172,6 +185,16 @@ export default function HomePage() {
       cancelled = true
     }
   }, [])
+
+  // Debounce the search box: filtering thousands of rows on every keystroke
+  // (and resetting the reveal window) makes typing feel laggy.
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      setSearch(searchInput)
+      setVisibleCount(INITIAL_VISIBLE)
+    }, SEARCH_DEBOUNCE_MS)
+    return () => window.clearTimeout(t)
+  }, [searchInput])
 
   useEffect(() => {
     let cancelled = false
@@ -259,6 +282,7 @@ export default function HomePage() {
         throw new Error(data.error || 'Failed to load all-time rankings')
       }
       dlog('info', 'Home', `showAllTime done — ${(data.rankings || []).length} players`)
+      homeEloCache = { rankings: data.rankings || [], missingRanges: data.missingRanges || [] }
       setMode('all-time')
       setEloData(data.rankings || [])
       setMissingRanges(data.missingRanges || [])
@@ -394,11 +418,8 @@ export default function HomePage() {
         <input
           className="search-input"
           placeholder="Search gamertags (reactive as you type)"
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value)
-            setVisibleCount(INITIAL_VISIBLE)
-          }}
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
         />
         {dateRangeProgress.active ? (
           <div className="progress-wrap">

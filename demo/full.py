@@ -152,7 +152,7 @@ def run_full_pipeline(args: argparse.Namespace) -> None:
         contenders_from_top_n=args.top_n,
         contenders_count=args.contenders,
         random_seed=args.seed,
-        openai_model=args.openai_model,
+        llm_model=args.llm_model,
         interactive=args.interactive,
         verbose=not args.quiet,
     )
@@ -186,7 +186,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-n", type=int, default=30, help="Part 4: sample contenders from top N ELO")
     parser.add_argument("--contenders", type=int, default=5, help="Part 4: contender count")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducible runs")
-    parser.add_argument("--openai-model", default="gpt-4o-mini", help="Part 4 OpenAI model")
+    parser.add_argument(
+        "--llm-model",
+        default="gemma-4-26B-A4B",
+        help="Part 4 vLLM served model name",
+    )
     parser.add_argument("--interactive", action="store_true", help="Part 4 interactive AI choice prompts")
     parser.add_argument("--quiet", action="store_true", help="Reduce verbosity from each stage")
     parser.add_argument(

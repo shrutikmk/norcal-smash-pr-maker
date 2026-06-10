@@ -1,2 +1,0 @@
-# Delegate to the repo root so there is a single dependency list.
--r ../../requirements.txt

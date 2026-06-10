@@ -2,7 +2,7 @@
 
 The main documentation for this repository lives in **[`../README.md`](../README.md)** (setup, env vars, how to run the Python API + dev server).
 
-This folder is the React 19 + Vite SPA. API requests to `/api/*` are proxied to `http://127.0.0.1:8765` during development (`vite.config.js`).
+This folder is the React 19 + Vite SPA. API requests to `/api/*` are proxied to `http://127.0.0.1:8775` during development by default (`vite.config.js`). Override with `PR_MAKER_API_PORT` or `VITE_API_PORT` if the API runs elsewhere.
 
 ```bash
 npm install

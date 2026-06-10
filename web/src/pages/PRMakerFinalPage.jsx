@@ -1,6 +1,7 @@
-import { useState, useMemo, useEffect, useRef } from 'react'
+import { useMemo, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useDebugLog } from '../debug/DebugContext.jsx'
+import RankingListPanel from '../components/RankingListPanel.jsx'
 
 function loadJson(key) {
   try { return JSON.parse(sessionStorage.getItem(key)) } catch { return null }
@@ -13,7 +14,6 @@ export default function PRMakerFinalPage() {
 
   const ordered = snapshot?.ordered || []
 
-  const [copied, setCopied] = useState(false)
   const [csvLoading, setCsvLoading] = useState(false)
   const [csvError, setCsvError] = useState('')
   const prefetchedRef = useRef(null)
@@ -31,31 +31,6 @@ export default function PRMakerFinalPage() {
     } catch {}
   }, [])
 
-  const markdown = useMemo(() => {
-    if (!ordered.length) return ''
-    return ordered
-      .map((p, i) => `${i + 1}. **${p.name}** — ${p.score} win${p.score === 1 ? '' : 's'}`)
-      .join('\n')
-  }, [ordered])
-
-  async function handleCopy() {
-    dlog('info', 'PRMaker/Final', 'Copying markdown ranking list to clipboard')
-    try {
-      await navigator.clipboard.writeText(markdown)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    } catch {
-      const ta = document.createElement('textarea')
-      ta.value = markdown
-      document.body.appendChild(ta)
-      ta.select()
-      document.execCommand('copy')
-      document.body.removeChild(ta)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    }
-  }
-
   function downloadCsvString(csvText) {
     const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' })
     const url = URL.createObjectURL(blob)
@@ -70,6 +45,12 @@ export default function PRMakerFinalPage() {
 
   async function handleExportCsv() {
     if (!ctx || !ordered.length) return
+    if (!prefetchedRef.current) {
+      try {
+        const csv = sessionStorage.getItem('prMakerPrefetchedCsv')
+        if (csv) prefetchedRef.current = csv
+      } catch {}
+    }
     if (prefetchedRef.current) {
       dlog('info', 'PRMaker/Final', 'Exporting CSV from prefetched data (instant)')
       downloadCsvString(prefetchedRef.current)
@@ -120,38 +101,18 @@ export default function PRMakerFinalPage() {
   return (
     <main className="process-page final-page" aria-label="PR Maker — Final Rankings">
       <div className="process-page-inner final-inner">
-        <h2 className="panel-title">PR Maker</h2>
-        <p className="process-subtitle">Final List of Rankings</p>
+        <header className="final-hero">
+          <h2 className="panel-title">PR Maker</h2>
+          <p className="process-subtitle">Final List of Rankings</p>
+        </header>
 
-        <div className="final-list-panel">
-          <h3 className="final-list-heading">Rankings</h3>
-          <ol className="final-ranking-list">
-            {ordered.map((p, i) => (
-              <li key={p.name} className="final-ranking-item">
-                <span className="final-ranking-pos">{i + 1}</span>
-                <span className="final-ranking-name">{p.name}</span>
-                <span className="final-ranking-dots" />
-                <span className="final-ranking-score">{p.score}</span>
-              </li>
-            ))}
-          </ol>
-        </div>
+        <RankingListPanel ordered={ordered} />
 
         <div className="final-export-row">
-          <div className="final-export-card">
-            <h4 className="final-export-label">Export list</h4>
-            <div className="final-md-wrap">
-              <pre className="final-md-text">{markdown}</pre>
-              <button type="button" className="final-copy-btn" onClick={handleCopy}>
-                {copied ? 'Copied' : 'Copy'}
-              </button>
-            </div>
-          </div>
-
-          <div className="final-export-card">
-            <h4 className="final-export-label">Export data</h4>
+          <div className="final-export-card final-export-card--csv">
+            <h4 className="final-export-label">Full data export</h4>
             <p className="final-export-desc">
-              Download a CSV with all derived statistics for each candidate.
+              Download a CSV with derived statistics for every candidate — ELO, attendance, notable results, and more.
             </p>
             <button
               type="button"

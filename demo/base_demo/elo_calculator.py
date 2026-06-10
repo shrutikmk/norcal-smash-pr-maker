@@ -15,6 +15,7 @@ Implements:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import random
@@ -119,11 +120,13 @@ query PlayerSets($playerId: ID!, $page: Int!, $perPage: Int!) {
           id
           slug
           name
+          isOnline
           tournament {
             id
             slug
             name
             startAt
+            isOnline
           }
         }
         slots {
@@ -206,11 +209,13 @@ query PlayerSetsFiltered($playerId: ID!, $page: Int!, $perPage: Int!, $tournamen
           id
           slug
           name
+          isOnline
           tournament {
             id
             slug
             name
             startAt
+            isOnline
           }
         }
         slots {
@@ -255,6 +260,7 @@ query TournamentsByGameDate($page: Int!, $perPage: Int!, $afterDate: Timestamp!,
       name
       slug
       startAt
+      isOnline
     }
   }
 }
@@ -278,7 +284,11 @@ class EloConfig:
     per_page: int = 50  # capped to MAX_OBJECTS_PER_REQUEST // 10 when making API calls
     max_retries: int = 5
     max_out_region_tournaments: int | None = 20
-    oor_early_stop_player_sets: bool = False
+    # Stop set-history pagination once a whole page predates the PR window —
+    # safe because the set cache is window-keyed (v2) and player.sets returns
+    # reverse-chronological pages. Cuts career-deep players from dozens of
+    # pages to a handful.
+    oor_early_stop_player_sets: bool = True
     oor_use_tournament_catalog: bool = False
 
 
@@ -443,6 +453,40 @@ def _safe_per_page(per_page: int) -> int:
 PLAYER_SETS_PER_PAGE = 40
 # EVENT_STANDINGS_QUERY can exceed complexity when perPage is too high.
 EVENT_STANDINGS_PER_PAGE = 50
+# Safety bound when materializing a full standings map (40 pages * 50 = 2000 entrants).
+EVENT_STANDINGS_MAX_PAGES = 40
+
+
+def _env_int(name: str, default: int, *, lo: int = 1, hi: int = 32) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return max(lo, min(hi, int(raw)))
+    except ValueError:
+        return default
+
+
+# Concurrency knobs for the OOR pipeline. The shared rate gate (startgg_rate_gate)
+# is the real throughput throttle; these only bound in-flight requests per player
+# so latency is hidden instead of paid serially.
+OOR_SET_PAGE_CONCURRENCY = _env_int("OOR_SET_PAGE_CONCURRENCY", 4)
+OOR_STANDINGS_CONCURRENCY = _env_int("OOR_STANDINGS_CONCURRENCY", 4)
+
+
+def _set_node_is_online(node: dict[str, Any]) -> bool:
+    """True when a player.sets node belongs to an online event/tournament.
+
+    Online results are not comparable to offline ones, so the OOR pipeline
+    excludes them. Checks the event-level flag first (hybrid tournaments can
+    host both), falling back to the tournament-level flag. Nodes cached before
+    these fields were queried have neither and are treated as offline.
+    """
+    event = node.get("event") or {}
+    ev_online = event.get("isOnline")
+    if ev_online is not None:
+        return bool(ev_online)
+    return bool((event.get("tournament") or {}).get("isOnline"))
 
 
 def _contains_opponent(opponent_names: list[str], needle: str) -> bool:
@@ -463,42 +507,86 @@ def _safe_slot_score(slot: dict[str, Any]) -> int | None:
     return value if isinstance(value, int) else None
 
 
-def _extract_player_set_result(node: dict[str, Any], player_id: str) -> dict[str, Any] | None:
-    """Extract one player's result from a raw PlayerSets node."""
+def _is_doubles_event_slug(event_slug: str, event_name: str = "") -> bool:
+    s = (event_slug or "").casefold()
+    n = (event_name or "").casefold()
+    return (
+        "doubles" in s or "2v2" in s
+        or "doubles" in n or "2v2" in n
+        or "crew battle" in n
+    )
+
+
+def _is_oor_eligible_event(event: dict[str, Any]) -> bool:
+    """PR Maker ranks singles resumes — skip doubles/side-game brackets in OOR."""
+    slug = str(event.get("slug") or "")
+    name = str(event.get("name") or "")
+    if _is_doubles_event_slug(slug, name):
+        return False
+    s = slug.casefold()
+    for needle in ("/melee-", "/brawl-", "/rivals", "/guilty-", "/guiltygear"):
+        if needle in s:
+            return False
+    return True
+
+
+def _entrant_display_name(parts: list[dict[str, Any]]) -> str:
+    names = [_player_display(p.get("prefix"), p.get("gamerTag")) for p in parts]
+    return " + ".join(n for n in names if n) or "?"
+
+
+def _participant_player_ids(parts: list[dict[str, Any]]) -> list[str]:
+    return [
+        str((p.get("player") or {}).get("id") or "")
+        for p in parts
+        if (p.get("player") or {}).get("id")
+    ]
+
+
+def _resolve_set_for_player(
+    node: dict[str, Any],
+    player_id: str,
+) -> tuple[str, bool, int, int] | None:
+    """Return (opponent_label, won, player_score, opponent_score) or None to skip."""
     slots = node.get("slots") or []
     if len(slots) < 2:
         return None
-    a, b = slots[0], slots[1]
-    parts_a = ((a.get("entrant") or {}).get("participants") or [])
-    parts_b = ((b.get("entrant") or {}).get("participants") or [])
-    if not parts_a or not parts_b:
-        return None
-
-    pid_a = str(((parts_a[0].get("player") or {}).get("id") or ""))
-    pid_b = str(((parts_b[0].get("player") or {}).get("id") or ""))
-    score_a = _safe_slot_score(a)
-    score_b = _safe_slot_score(b)
-    if score_a is None or score_b is None:
-        return None
-
-    name_a = _player_display(parts_a[0].get("prefix"), parts_a[0].get("gamerTag"))
-    name_b = _player_display(parts_b[0].get("prefix"), parts_b[0].get("gamerTag"))
-
-    if pid_a == str(player_id):
-        return {
-            "opponent": name_b,
-            "player_score": score_a,
-            "opponent_score": score_b,
-            "result": "W" if score_a > score_b else "L",
-        }
-    if pid_b == str(player_id):
-        return {
-            "opponent": name_a,
-            "player_score": score_b,
-            "opponent_score": score_a,
-            "result": "W" if score_b > score_a else "L",
-        }
+    pid = str(player_id)
+    for i, slot in enumerate(slots):
+        parts = (slot.get("entrant") or {}).get("participants") or []
+        if not parts or pid not in _participant_player_ids(parts):
+            continue
+        opp_slot = slots[1 - i]
+        opp_parts = (opp_slot.get("entrant") or {}).get("participants") or []
+        if not opp_parts:
+            return None
+        my_score = _safe_slot_score(slot)
+        opp_score = _safe_slot_score(opp_slot)
+        if my_score is None or opp_score is None:
+            return None
+        if my_score == opp_score:
+            return None
+        return (
+            _entrant_display_name(opp_parts),
+            my_score > opp_score,
+            my_score,
+            opp_score,
+        )
     return None
+
+
+def _extract_player_set_result(node: dict[str, Any], player_id: str) -> dict[str, Any] | None:
+    """Extract one player's result from a raw PlayerSets node."""
+    resolved = _resolve_set_for_player(node, player_id)
+    if resolved is None:
+        return None
+    opponent, won, player_score, opponent_score = resolved
+    return {
+        "opponent": opponent,
+        "player_score": player_score,
+        "opponent_score": opponent_score,
+        "result": "W" if won else "L",
+    }
 
 
 def _load_in_region_sets(config: EloConfig) -> list[dict[str, Any]]:
@@ -507,6 +595,18 @@ def _load_in_region_sets(config: EloConfig) -> list[dict[str, Any]]:
 
     after = _date_to_unix(config.start_date) if config.start_date else None
     before = _date_to_unix(config.end_date) if config.end_date else None
+
+    # Prefetch tournament metadata once (name + start_at keyed by id/slug) instead
+    # of one SELECT per set row — the old N+1 pattern cost ~10k queries on a full
+    # corpus load and dominated every ELO recompute.
+    tmeta: dict[tuple[str, str], tuple[str, int]] = {}
+    for tid, slug, tname, t_start in tconn.execute(
+        "SELECT tournament_id, event_slug, name, start_at FROM tournaments"
+    ):
+        tmeta[(str(tid), str(slug or ""))] = (
+            str(tname or ""),
+            int(t_start) if t_start is not None else 0,
+        )
 
     sql = """
         SELECT s.set_id, s.event_slug, s.p1_name, s.p2_name, s.p1_score, s.p2_score,
@@ -531,12 +631,9 @@ def _load_in_region_sets(config: EloConfig) -> list[dict[str, Any]]:
         if config.exclude_tournament_ids and str(tournament_id) in config.exclude_tournament_ids:
             continue
 
-        trow = tconn.execute(
-            "SELECT name, start_at FROM tournaments WHERE tournament_id = ? AND event_slug = ? LIMIT 1",
-            (str(tournament_id), event_slug),
-        ).fetchone()
+        trow = tmeta.get((str(tournament_id), str(event_slug or "")))
         tname = (trow[0] if trow else event_name) or ""
-        start_at = int(trow[1]) if trow and trow[1] is not None else 0
+        start_at = trow[1] if trow else 0
 
         if config.exclude_tournament_names and any(ex in tname for ex in config.exclude_tournament_names):
             continue
@@ -641,6 +738,36 @@ def _build_player_opponent_records(
     return records
 
 
+def _bracket_placement_index(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index placement rows by event_slug (one bracket per key)."""
+    out: dict[str, dict[str, Any]] = {}
+    rows = (report.get("in_region_placements", []) or []) + (report.get("out_region_placements", []) or [])
+    for row in rows:
+        slug = str(row.get("event_slug") or "")
+        if not slug:
+            continue
+        out[slug] = {
+            "tournament_name": str(row.get("tournament_name") or ""),
+            "event_slug": slug,
+            "placement": row.get("placement"),
+            "wins": int(row.get("wins") or 0),
+            "losses": int(row.get("losses") or 0),
+        }
+    return out
+
+
+def _bracket_display_name(tournament_name: str, event_slug: str) -> tuple[str, str]:
+    """Return (tournament label, bracket label) for comparison UI."""
+    slug = (event_slug or "").strip()
+    tail = slug.rsplit("/", 1)[-1].replace("-", " ").replace("_", " ") if slug else ""
+    tname = (tournament_name or "").strip()
+    if tname and tail and tail.lower() not in tname.lower():
+        return tname, tail
+    if tname:
+        return tname, tail or slug
+    return tail or slug or "(unknown)", tail or slug
+
+
 def _tournament_summary_rows(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     rows = (report.get("in_region_placements", []) or []) + (report.get("out_region_placements", []) or [])
@@ -711,23 +838,30 @@ def _expanded_head_to_head(
         for o in shared_losses_names
     ]
 
-    t1 = _tournament_summary_rows(r1)
-    t2 = _tournament_summary_rows(r2)
-    shared_t_keys = sorted(
-        set(t1.keys()) & set(t2.keys()),
-        key=lambda k: str(t1[k].get("tournament_name") or t2[k].get("tournament_name") or ""),
+    b1 = _bracket_placement_index(r1)
+    b2 = _bracket_placement_index(r2)
+    shared_bracket_slugs = sorted(
+        set(b1.keys()) & set(b2.keys()),
+        key=lambda slug: (
+            str(b1[slug].get("tournament_name") or b2[slug].get("tournament_name") or ""),
+            slug,
+        ),
     )
     tournaments_both = []
-    for k in shared_t_keys:
-        a, b = t1[k], t2[k]
+    for slug in shared_bracket_slugs:
+        a, b = b1[slug], b2[slug]
+        tname, bracket = _bracket_display_name(
+            str(a.get("tournament_name") or b.get("tournament_name") or ""),
+            slug,
+        )
         tournaments_both.append({
-            "name": a.get("tournament_name") or b.get("tournament_name") or "(unknown)",
-            "p1Place": a.get("best_placement"),
+            "name": tname,
+            "bracket": bracket,
+            "eventSlug": slug,
+            "p1Place": a.get("placement"),
             "p1WL": f"{a.get('wins', 0)}-{a.get('losses', 0)}",
-            "p1Events": len(a.get("event_rows", [])),
-            "p2Place": b.get("best_placement"),
+            "p2Place": b.get("placement"),
             "p2WL": f"{b.get('wins', 0)}-{b.get('losses', 0)}",
-            "p2Events": len(b.get("event_rows", [])),
         })
 
     p1_unique_wins = sorted(
@@ -752,7 +886,12 @@ def _expanded_head_to_head(
 
 def _init_player_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.DatabaseError:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS player_identity (
@@ -1400,6 +1539,7 @@ def _fetch_player_sets_live(
     page_callback: Any = None,
     pr_window_start_unix: int | None = None,
     metrics_out: dict[str, Any] | None = None,
+    page_concurrency: int | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch set nodes for a player with cooperative cancellation and optional early-stop.
 
@@ -1411,59 +1551,83 @@ def _fetch_player_sets_live(
 
     When *metrics_out* is provided (mutable dict), the function populates it with:
     ``pages_fetched``, ``total_pages``, ``early_stop``, ``wall_ms``.
+
+    Pages after page 1 are fetched in concurrent batches of
+    ``OOR_SET_PAGE_CONCURRENCY`` (rate gate still bounds aggregate request rate);
+    the early-stop check runs between batches so deep career history is still
+    skipped without giving up parallelism inside the PR window.
     """
     t0 = time.monotonic()
-    nodes_all: list[dict[str, Any]] = []
     current_per_page = min(per_page, PLAYER_SETS_PER_PAGE)
-    page = 1
-    early_stopped = False
-    last_total_pages = 1
-    while True:
-        if cancel_check and cancel_check():
-            raise CancelledOOR(f"Cancelled before page {page}")
+    concurrency = max(1, page_concurrency or OOR_SET_PAGE_CONCURRENCY)
+
+    def _all_nodes_predate_window(nodes: list[dict[str, Any]]) -> bool:
+        if pr_window_start_unix is None or not nodes:
+            return False
+        start_ats = []
+        for n in nodes:
+            sa = ((n.get("event") or {}).get("tournament") or {}).get("startAt")
+            if sa is not None:
+                start_ats.append(int(sa))
+        return bool(start_ats) and len(start_ats) == len(nodes) and max(start_ats) < pr_window_start_unix
+
+    while True:  # complexity-retry loop: restart at lower perPage
         try:
-            payload = client.gql(
-                PLAYER_SETS_QUERY,
-                {"playerId": str(player_id), "page": page, "perPage": current_per_page},
-                max_retries=max_retries,
-            )
+            if cancel_check and cancel_check():
+                raise CancelledOOR("Cancelled before page 1")
+
+            def _fetch_page(page: int) -> tuple[list[dict[str, Any]], int]:
+                payload = client.gql(
+                    PLAYER_SETS_QUERY,
+                    {"playerId": str(player_id), "page": page, "perPage": current_per_page},
+                    max_retries=max_retries,
+                )
+                sets_conn = payload.get("data", {}).get("player", {}).get("sets", {})
+                nodes = sets_conn.get("nodes", []) or []
+                total = int(sets_conn.get("pageInfo", {}).get("totalPages", 1) or 1)
+                return nodes, total
+
+            nodes_all, total_pages = _fetch_page(1)
+            pages_fetched = 1
+            early_stopped = False
+            if page_callback:
+                page_callback(1, total_pages, nodes_all)
+
+            if total_pages > 1 and not _all_nodes_predate_window(nodes_all):
+                next_page = 2
+                with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+                    while next_page <= total_pages:
+                        if cancel_check and cancel_check():
+                            raise CancelledOOR(f"Cancelled before page {next_page}")
+                        batch = list(range(next_page, min(next_page + concurrency, total_pages + 1)))
+                        results = list(pool.map(lambda p: _fetch_page(p)[0], batch))
+                        batch_stop = False
+                        for page, nodes in zip(batch, results):
+                            nodes_all.extend(nodes)
+                            pages_fetched += 1
+                            if page_callback:
+                                page_callback(page, total_pages, nodes)
+                            if _all_nodes_predate_window(nodes):
+                                batch_stop = True
+                        if batch_stop:
+                            early_stopped = True
+                            break
+                        next_page = batch[-1] + 1
+            elif total_pages > 1:
+                early_stopped = True
+
+            if metrics_out is not None:
+                metrics_out["pages_fetched"] = pages_fetched
+                metrics_out["total_pages"] = total_pages
+                metrics_out["early_stop"] = early_stopped
+                metrics_out["wall_ms"] = round((time.monotonic() - t0) * 1000)
+                metrics_out["page_concurrency"] = concurrency
+            return nodes_all
         except RuntimeError as e:
             if "complexity limit exceeded" in str(e).lower() and current_per_page > 5:
                 current_per_page = max(5, current_per_page // 2)
-                nodes_all = []
-                page = 1
-                early_stopped = False
                 continue
             raise
-        sets_conn = payload.get("data", {}).get("player", {}).get("sets", {})
-        nodes = sets_conn.get("nodes", []) or []
-        nodes_all.extend(nodes)
-        last_total_pages = sets_conn.get("pageInfo", {}).get("totalPages", 1)
-        if page_callback:
-            page_callback(page, last_total_pages, nodes)
-        if page >= last_total_pages:
-            break
-
-        # Early-stop: if every node on this page predates the PR window, remaining
-        # pages are even older and can be skipped.
-        if pr_window_start_unix is not None and nodes:
-            start_ats = []
-            for n in nodes:
-                sa = ((n.get("event") or {}).get("tournament") or {}).get("startAt")
-                if sa is not None:
-                    start_ats.append(int(sa))
-            if start_ats and len(start_ats) == len(nodes) and max(start_ats) < pr_window_start_unix:
-                early_stopped = True
-                break
-
-        page += 1
-
-    if metrics_out is not None:
-        metrics_out["pages_fetched"] = page
-        metrics_out["total_pages"] = last_total_pages
-        metrics_out["early_stop"] = early_stopped
-        metrics_out["wall_ms"] = round((time.monotonic() - t0) * 1000)
-    return nodes_all
 
 
 # --- M4: Tournament catalog + batched tournamentIds filter ---
@@ -1484,7 +1648,8 @@ def fetch_oor_tournament_catalog(
     """Return tournament IDs in [after, before] that are NOT in-region.
 
     Paginates ``tournaments`` with ``afterDate / beforeDate / videogameIds`` and subtracts
-    *in_region_tournament_ids*.
+    *in_region_tournament_ids*. Online tournaments are excluded — online results
+    are not comparable to offline ones for PR purposes.
     """
     vids = videogame_ids or [SMASH_ULTIMATE_VIDEOGAME_ID]
     all_ids: list[str] = []
@@ -1505,7 +1670,7 @@ def fetch_oor_tournament_catalog(
         nodes = tourney_conn.get("nodes", []) or []
         for n in nodes:
             tid = str(n.get("id") or "")
-            if tid and tid not in in_region_tournament_ids:
+            if tid and tid not in in_region_tournament_ids and not n.get("isOnline"):
                 all_ids.append(tid)
         total_pages = tourney_conn.get("pageInfo", {}).get("totalPages", 1)
         if page >= total_pages:
@@ -1598,6 +1763,102 @@ def _fetch_event_placement_for_player_live(
     return None
 
 
+def fetch_event_standings_map(
+    client: StartGGClient,
+    event_id: str,
+    per_page: int = EVENT_STANDINGS_PER_PAGE,
+    max_retries: int = 5,
+    *,
+    max_pages: int = EVENT_STANDINGS_MAX_PAGES,
+) -> dict[str, int | None]:
+    """Fetch the full standings of an event as ``{player_id: placement}``.
+
+    Unlike :func:`_fetch_event_placement_for_player_live` (which rescans the same
+    event once per player), the returned map answers placement lookups for *every*
+    player in one pass — and finished-event standings never change, so callers can
+    cache the map permanently keyed by ``event_id``.
+    """
+    out: dict[str, int | None] = {}
+    page = 1
+    while True:
+        payload = client.gql(
+            EVENT_STANDINGS_QUERY,
+            {"eventId": str(event_id), "page": page, "perPage": _safe_per_page(per_page)},
+            max_retries=max_retries,
+        )
+        standings = payload.get("data", {}).get("event", {}).get("standings", {})
+        nodes = standings.get("nodes", []) or []
+        total_pages = int(standings.get("pageInfo", {}).get("totalPages", 1) or 1)
+        for n in nodes:
+            placement = n.get("placement")
+            placement_val = int(placement) if isinstance(placement, int) else None
+            for part in ((n.get("entrant") or {}).get("participants") or []):
+                pid = str(((part.get("player") or {}).get("id") or ""))
+                if pid:
+                    out[pid] = placement_val
+        if page >= total_pages or page >= max_pages:
+            break
+        page += 1
+    return out
+
+
+def _resolve_placements(
+    client: StartGGClient,
+    player_id: str,
+    event_ids: list[str],
+    max_retries: int,
+    *,
+    standings_lookup: Any = None,
+    standings_store: Any = None,
+    concurrency: int | None = None,
+    cancel_check: Any = None,
+) -> tuple[dict[str, int | None], int, int]:
+    """Resolve this player's placement for many events with shared-cache reuse.
+
+    For each event: consult ``standings_lookup(event_id) -> {player_id: placement} | None``
+    first; cache misses fetch the *full* standings map concurrently (bounded) and
+    persist it via ``standings_store(event_id, map)`` so every other player in the
+    candidate pool gets the same event for free.
+
+    Returns ``(placements_by_event_id, cache_hits, cache_misses)``.
+    """
+    pid = str(player_id)
+    placements: dict[str, int | None] = {}
+    misses: list[str] = []
+    hits = 0
+    for eid in event_ids:
+        cached_map = standings_lookup(eid) if standings_lookup else None
+        if cached_map is not None:
+            placements[eid] = cached_map.get(pid)
+            hits += 1
+        else:
+            misses.append(eid)
+
+    if misses:
+        if cancel_check and cancel_check():
+            raise CancelledOOR("Cancelled before standings fetch")
+        workers = max(1, min(concurrency or OOR_STANDINGS_CONCURRENCY, len(misses)))
+
+        def _fetch_map(eid: str) -> tuple[str, dict[str, int | None]]:
+            return eid, fetch_event_standings_map(client, eid, max_retries=max_retries)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_map, eid): eid for eid in misses}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    eid, smap = fut.result()
+                except Exception:
+                    placements[futures[fut]] = None
+                    continue
+                placements[eid] = smap.get(pid)
+                if standings_store:
+                    try:
+                        standings_store(eid, smap)
+                    except Exception:
+                        pass
+    return placements, hits, len(misses)
+
+
 def _dq_filtered_in_region_tournament_count(player_sets: list[dict[str, Any]], name: str) -> int:
     """Count tournaments where `name` has at least one non-DQ set (DQ = that player's score is -1)."""
     flags: dict[str, bool] = {}
@@ -1634,6 +1895,8 @@ def _get_live_player_report(
     tournament_cache_lookup: Any = None,
     tournament_cache_store: Any = None,
     oor_catalog_tournament_ids: list[str] | None = None,
+    standings_lookup: Any = None,
+    standings_store: Any = None,
 ) -> dict[str, Any]:
     player_sets = [s for s in in_region_sets if s["p1"] == canonical_name or s["p2"] == canonical_name]
     in_wins = in_losses = 0
@@ -1660,38 +1923,37 @@ def _get_live_player_report(
             "in_region_placements",
             {
                 "canonical_name": canonical_name,
-                "message": f"Fetching in-region bracket placements from start.gg ({_pe_total} event(s))",
+                "message": f"Resolving in-region bracket placements ({_pe_total} event(s), shared standings cache)",
                 "total": _pe_total,
                 "index": 0,
             },
         )
-    for _pi, event_slug in enumerate(_placement_events):
+    _in_event_ids = [str(in_event_meta[es].get("event_id") or "") for es in _placement_events]
+    _in_placements, _in_hits, _in_misses = _resolve_placements(
+        client, player_id, _in_event_ids, config.max_retries,
+        standings_lookup=standings_lookup, standings_store=standings_store,
+        cancel_check=cancel_check,
+    )
+    if phase_callback and _pe_total:
+        phase_callback(
+            "in_region_placements",
+            {
+                "canonical_name": canonical_name,
+                "message": f"In-region placements resolved: {_in_hits} from standings cache, {_in_misses} fetched live",
+                "total": _pe_total,
+                "index": _pe_total,
+                "cache_hits": _in_hits,
+                "cache_misses": _in_misses,
+            },
+        )
+    for event_slug in _placement_events:
         meta = in_event_meta[event_slug]
         event_id = str(meta.get("event_id") or "")
-        if not event_id:
-            continue
-        if phase_callback:
-            phase_callback(
-                "in_region_placements",
-                {
-                    "canonical_name": canonical_name,
-                    "message": f"Standings/placement for {event_slug}",
-                    "total": _pe_total,
-                    "index": _pi + 1,
-                    "event_slug": event_slug,
-                },
-            )
-        placement = _fetch_event_placement_for_player_live(
-            client,
-            event_id,
-            player_id,
-            EVENT_STANDINGS_PER_PAGE,
-            config.max_retries,
-        )
-        ev_sets = [s for s in player_sets if s["event_slug"] == event_slug]
         ev_wins = 0
         ev_losses = 0
-        for s in ev_sets:
+        for s in player_sets:
+            if s["event_slug"] != event_slug:
+                continue
             if (s["p1"] == canonical_name and s["p1_score"] > s["p2_score"]) or (
                 s["p2"] == canonical_name and s["p2_score"] > s["p1_score"]
             ):
@@ -1703,7 +1965,7 @@ def _get_live_player_report(
                 "tournament_id": str(meta.get("tournament_id") or ""),
                 "tournament_name": meta.get("tournament_name") or "",
                 "event_slug": event_slug,
-                "placement": placement,
+                "placement": _in_placements.get(event_id),
                 "wins": ev_wins,
                 "losses": ev_losses,
             }
@@ -1785,11 +2047,17 @@ def _get_live_player_report(
 
     # Aggregate out-of-region stats from live player set history.
     out_events: dict[str, dict[str, Any]] = {}
+    _online_skipped: set[str] = set()
     for node in player_set_nodes:
         event = node.get("event") or {}
+        if not _is_oor_eligible_event(event):
+            continue
         tournament = event.get("tournament") or {}
         tournament_id = str(tournament.get("id") or "")
         if not tournament_id or tournament_id in in_region_tournament_ids:
+            continue
+        if _set_node_is_online(node):
+            _online_skipped.add(tournament_id)
             continue
         start_at = int(tournament.get("startAt") or 0)
         if after is not None and start_at < after:
@@ -1814,36 +2082,16 @@ def _get_live_player_report(
                 "notable_losses": [],
             }
 
-        slots = node.get("slots") or []
-        if len(slots) < 2:
+        resolved = _resolve_set_for_player(node, str(player_id))
+        if resolved is None:
             continue
-        slot_a, slot_b = slots[0], slots[1]
-        parts_a = (slot_a.get("entrant") or {}).get("participants") or []
-        parts_b = (slot_b.get("entrant") or {}).get("participants") or []
-        if not parts_a or not parts_b:
-            continue
-        pid_a = str(((parts_a[0].get("player") or {}).get("id") or ""))
-        pid_b = str(((parts_b[0].get("player") or {}).get("id") or ""))
-        score_a = _safe_slot_score(slot_a)
-        score_b = _safe_slot_score(slot_b)
-        if score_a is None or score_b is None:
-            continue
-        name_a = _player_display(parts_a[0].get("prefix"), parts_a[0].get("gamerTag"))
-        name_b = _player_display(parts_b[0].get("prefix"), parts_b[0].get("gamerTag"))
-        if pid_a == str(player_id):
-            if score_a > score_b:
-                out_events[key]["wins"] += 1
-                out_events[key]["notable_wins"].append(name_b)
-            else:
-                out_events[key]["losses"] += 1
-                out_events[key]["notable_losses"].append(name_b)
-        elif pid_b == str(player_id):
-            if score_b > score_a:
-                out_events[key]["wins"] += 1
-                out_events[key]["notable_wins"].append(name_a)
-            else:
-                out_events[key]["losses"] += 1
-                out_events[key]["notable_losses"].append(name_a)
+        opp_name, won, _, _ = resolved
+        if won:
+            out_events[key]["wins"] += 1
+            out_events[key]["notable_wins"].append(opp_name)
+        else:
+            out_events[key]["losses"] += 1
+            out_events[key]["notable_losses"].append(opp_name)
 
     out_events_list = sorted(out_events.values(), key=lambda x: x["start_at"], reverse=True)
     if config.max_out_region_tournaments is not None:
@@ -1858,13 +2106,15 @@ def _get_live_player_report(
 
     if phase_callback:
         tourney_names = [ev.get("tournament_name") or ev.get("event_slug") or "?" for ev in out_events_list]
+        _online_note = f" ({len(_online_skipped)} online tournament(s) excluded)" if _online_skipped else ""
         phase_callback(
             "oor_tournaments_discovered",
             {
                 "canonical_name": canonical_name,
-                "message": f"Discovered {len(out_events_list)} OOR tournament(s) in date range: {', '.join(tourney_names[:15])}{'…' if len(tourney_names) > 15 else ''}",
+                "message": f"Discovered {len(out_events_list)} OOR tournament(s) in date range{_online_note}: {', '.join(tourney_names[:15])}{'…' if len(tourney_names) > 15 else ''}",
                 "count": len(out_events_list),
                 "tournaments": tourney_names,
+                "online_excluded": len(_online_skipped),
             },
         )
 
@@ -1876,18 +2126,56 @@ def _get_live_player_report(
     _oor_ev_total = len(out_events_list)
     _cache_hits = 0
     _cache_misses = 0
+
+    # Pass 1: split into per-player per-event result cache hits vs misses.
+    # Keyed by event_slug (not tournament_id): one tournament can host multiple
+    # brackets (singles + 2v2) and each must keep its own W-L / notables.
+    _cached_results: dict[str, dict[str, Any]] = {}
+    _miss_events: list[dict[str, Any]] = []
+    for ev in out_events_list:
+        cache_key = str(ev.get("event_slug") or ev.get("event_id") or "")
+        if not cache_key:
+            _miss_events.append(ev)
+            _cache_misses += 1
+            continue
+        cached_result = tournament_cache_lookup(cache_key) if tournament_cache_lookup else None
+        if cached_result is not None:
+            _cached_results[cache_key] = cached_result
+            _cache_hits += 1
+        else:
+            _miss_events.append(ev)
+            _cache_misses += 1
+
+    # Pass 2: resolve placements for all misses in one parallel batch (shared
+    # standings-map cache means other candidates reuse these events for free).
+    _miss_event_ids = [str(ev["event_id"] or "") for ev in _miss_events if str(ev["event_id"] or "")]
+    if _miss_event_ids and phase_callback:
+        phase_callback(
+            "oor_tournament_cache_miss",
+            {
+                "canonical_name": canonical_name,
+                "message": f"{len(_miss_event_ids)} OOR tournament(s) not cached — fetching standings in parallel…",
+                "total": _oor_ev_total,
+            },
+        )
+    _oor_placements: dict[str, int | None] = {}
+    if _miss_event_ids:
+        _oor_placements, _, _ = _resolve_placements(
+            client, player_id, _miss_event_ids, config.max_retries,
+            standings_lookup=standings_lookup, standings_store=standings_store,
+            cancel_check=cancel_check,
+        )
+
+    # Pass 3: assemble rows in chronological order, emitting progress per event.
     for _oi, ev in enumerate(out_events_list):
         tid = ev["tournament_id"]
+        cache_key = str(ev.get("event_slug") or ev.get("event_id") or "")
         t_label = ev.get("tournament_name") or ev.get("event_slug") or tid
-
-        cached_result = tournament_cache_lookup(tid) if tournament_cache_lookup else None
+        cached_result = _cached_results.get(cache_key)
         if cached_result is not None:
-            _cache_hits += 1
             placement = cached_result.get("placement")
             c_wins = int(cached_result.get("wins", 0))
             c_losses = int(cached_result.get("losses", 0))
-            c_nw = cached_result.get("notable_wins", [])
-            c_nl = cached_result.get("notable_losses", [])
             if phase_callback:
                 phase_callback(
                     "oor_tournament_cache_hit",
@@ -1903,43 +2191,26 @@ def _get_live_player_report(
                         "placement": placement,
                     },
                 )
-            notable_wins.extend(c_nw)
-            notable_losses.extend(c_nl)
+            notable_wins.extend(cached_result.get("notable_wins", []))
+            notable_losses.extend(cached_result.get("notable_losses", []))
             placements.append({
                 "tournament_id": tid,
                 "tournament_name": ev["tournament_name"],
                 "event_slug": ev["event_slug"],
+                "event_id": str(cached_result.get("event_id") or ev.get("event_id") or ""),
+                "start_at": int(cached_result.get("start_at") or ev.get("start_at") or 0),
                 "placement": placement,
                 "wins": c_wins,
                 "losses": c_losses,
+                "notable_wins": cached_result.get("notable_wins", []),
+                "notable_losses": cached_result.get("notable_losses", []),
             })
             out_wins = out_wins - int(ev["wins"]) + c_wins
             out_losses = out_losses - int(ev["losses"]) + c_losses
             continue
 
-        _cache_misses += 1
         event_id = str(ev["event_id"] or "")
-        placement = None
-        if phase_callback:
-            phase_callback(
-                "oor_tournament_cache_miss",
-                {
-                    "canonical_name": canonical_name,
-                    "message": f"Tournament {t_label}: CACHE MISS — processing sets, fetching placement…",
-                    "tournament_id": tid,
-                    "tournament_name": t_label,
-                    "index": _oi + 1,
-                    "total": _oor_ev_total,
-                },
-            )
-        if event_id:
-            placement = _fetch_event_placement_for_player_live(
-                client,
-                event_id,
-                player_id,
-                EVENT_STANDINGS_PER_PAGE,
-                config.max_retries,
-            )
+        placement = _oor_placements.get(event_id)
         notable_wins.extend(ev["notable_wins"])
         notable_losses.extend(ev["notable_losses"])
         result_row = {
@@ -1954,16 +2225,9 @@ def _get_live_player_report(
             "notable_wins": ev["notable_wins"],
             "notable_losses": ev["notable_losses"],
         }
-        placements.append({
-            "tournament_id": tid,
-            "tournament_name": ev["tournament_name"],
-            "event_slug": ev["event_slug"],
-            "placement": placement,
-            "wins": ev["wins"],
-            "losses": ev["losses"],
-        })
-        if tournament_cache_store:
-            tournament_cache_store(tid, result_row)
+        placements.append(dict(result_row))
+        if tournament_cache_store and cache_key:
+            tournament_cache_store(cache_key, result_row)
         if phase_callback:
             phase_callback(
                 "oor_tournament_processed",
@@ -2038,8 +2302,25 @@ def _upsert_live_player_report(conn: sqlite3.Connection, report: dict[str, Any],
         out_region_wins=report["out_region_wins"],
         out_region_losses=report["out_region_losses"],
     )
-    for p in report.get("in_region_placements", []):
-        conn.execute(
+    rows: list[tuple] = []
+    for region, placements in (
+        ("in_region", report.get("in_region_placements", [])),
+        ("out_region", report["out_region_placements"]),
+    ):
+        for p in placements:
+            rows.append((
+                report["canonical_name"],
+                p.get("tournament_id", ""),
+                p.get("event_slug", ""),
+                p.get("tournament_name", ""),
+                region,
+                p.get("placement"),
+                p.get("wins", 0),
+                p.get("losses", 0),
+                now,
+            ))
+    if rows:
+        conn.executemany(
             """
             INSERT INTO player_tournament_stats
             (canonical_name, tournament_id, event_slug, tournament_name, region, placement, wins, losses, updated_at)
@@ -2050,41 +2331,7 @@ def _upsert_live_player_report(conn: sqlite3.Connection, report: dict[str, Any],
                 losses=excluded.losses,
                 updated_at=excluded.updated_at
             """,
-            (
-                report["canonical_name"],
-                p.get("tournament_id", ""),
-                p.get("event_slug", ""),
-                p.get("tournament_name", ""),
-                "in_region",
-                p.get("placement"),
-                p.get("wins", 0),
-                p.get("losses", 0),
-                now,
-            ),
-        )
-    for p in report["out_region_placements"]:
-        conn.execute(
-            """
-            INSERT INTO player_tournament_stats
-            (canonical_name, tournament_id, event_slug, tournament_name, region, placement, wins, losses, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(canonical_name, tournament_id, event_slug, region) DO UPDATE SET
-                placement=excluded.placement,
-                wins=excluded.wins,
-                losses=excluded.losses,
-                updated_at=excluded.updated_at
-            """,
-            (
-                report["canonical_name"],
-                p.get("tournament_id", ""),
-                p.get("event_slug", ""),
-                p.get("tournament_name", ""),
-                "out_region",
-                p.get("placement"),
-                p.get("wins", 0),
-                p.get("losses", 0),
-                now,
-            ),
+            rows,
         )
     conn.commit()
 
@@ -2257,25 +2504,30 @@ def run_demo(config: EloConfig, *, verbose: bool = True) -> None:
                 f"{p2} {rec2[opp]['wins']}-{rec2[opp]['losses']}"
             )
 
-        t1 = _tournament_summary_rows(player_reports[p1])
-        t2 = _tournament_summary_rows(player_reports[p2])
-        shared_t_keys = sorted(
-            set(t1.keys()) & set(t2.keys()),
-            key=lambda k: str(t1[k].get("tournament_name") or t2[k].get("tournament_name") or ""),
+        b1 = _bracket_placement_index(player_reports[p1])
+        b2 = _bracket_placement_index(player_reports[p2])
+        shared_bracket_slugs = sorted(
+            set(b1.keys()) & set(b2.keys()),
+            key=lambda slug: (
+                str(b1[slug].get("tournament_name") or b2[slug].get("tournament_name") or ""),
+                slug,
+            ),
         )
-        print(f"\n[HEAD-TO-HEAD] Tournaments both attended: {len(shared_t_keys)}")
-        for k in shared_t_keys:
-            a = t1[k]
-            b = t2[k]
-            tname = a.get("tournament_name") or b.get("tournament_name") or "(unknown)"
-            print(f"  {tname}")
+        print(f"\n[HEAD-TO-HEAD] Shared brackets: {len(shared_bracket_slugs)}")
+        for slug in shared_bracket_slugs:
+            a = b1[slug]
+            b = b2[slug]
+            tname, bracket = _bracket_display_name(
+                str(a.get("tournament_name") or b.get("tournament_name") or ""),
+                slug,
+            )
+            label = f"{tname} — {bracket}" if bracket and bracket.lower() not in tname.lower() else tname
+            print(f"  {label} ({slug})")
             print(
-                f"    {p1}: best_place={a.get('best_placement')} W-L={a.get('wins', 0)}-{a.get('losses', 0)} "
-                f"events={len(a.get('event_rows', []))}"
+                f"    {p1}: place={a.get('placement')} W-L={a.get('wins', 0)}-{a.get('losses', 0)}"
             )
             print(
-                f"    {p2}: best_place={b.get('best_placement')} W-L={b.get('wins', 0)}-{b.get('losses', 0)} "
-                f"events={len(b.get('event_rows', []))}"
+                f"    {p2}: place={b.get('placement')} W-L={b.get('wins', 0)}-{b.get('losses', 0)}"
             )
     else:
         print("[HEAD-TO-HEAD] Could not compute expanded comparison because one live report was unavailable.")

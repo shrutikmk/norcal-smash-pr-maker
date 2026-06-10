@@ -12,7 +12,7 @@ Demo behavior:
 - Runs pairwise comparisons and prints player cards
 - Uses a 50/50 split between:
   - simulated human choice (higher ELO)
-  - OpenAI-assisted choice (with explicit caveat for out-of-region uncertainty)
+  - local LLM-assisted choice via vLLM Metal (with explicit caveat for out-of-region uncertainty)
 - Stores generated comparison cards in the Part 3 player DB
 - Prints final ranking
 """
@@ -25,6 +25,7 @@ import json
 import os
 import random
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +39,24 @@ try:
 except Exception:
     pass
 
+_TOOLS_DIR = Path(__file__).resolve().parent.parent.parent / "tools"
+if str(_TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TOOLS_DIR))
+
 try:
-    from openai import OpenAI
+    import httpx
+    from llm_client import (  # type: ignore[import-untyped]
+        chat_completion_text,
+        llm_unavailable_reason,
+        probe_vllm_route,
+        vllm_route_from_env,
+    )
 except Exception:  # pragma: no cover - optional dependency at runtime
-    OpenAI = None  # type: ignore[assignment]
+    httpx = None  # type: ignore[assignment]
+    chat_completion_text = None  # type: ignore[assignment]
+    llm_unavailable_reason = None  # type: ignore[assignment]
+    probe_vllm_route = None  # type: ignore[assignment]
+    vllm_route_from_env = None  # type: ignore[assignment]
 
 from elo_calculator import (
     DEFAULT_PLAYER_DB,
@@ -71,7 +86,7 @@ class RankingConfig:
     contenders_from_top_n: int = 30
     contenders_count: int = 5
     random_seed: int | None = None
-    openai_model: str = "gpt-4o-mini"
+    llm_model: str = "gemma-4-26B-A4B"
     interactive: bool = False
     verbose: bool = True
 
@@ -280,33 +295,40 @@ Rules:
 """.strip()
 
 
-def _openai_assisted_decision(
+def _llm_assisted_decision(
     *,
     card: dict[str, Any],
     model: str,
     client: Any,
+    route: Any,
 ) -> tuple[str, str, dict[str, Any]]:
     p1, p2 = card["players"]
 
     justification_prompt = _build_ai_justification_prompt(card)
-    justification_resp = client.chat.completions.create(
+    justification = chat_completion_text(
+        client,
+        api_base=route.api_base,
         model=model,
         messages=[
             {"role": "system", "content": "You are a careful esports ranking analyst."},
             {"role": "user", "content": justification_prompt},
         ],
+        enable_thinking=False,
     )
-    justification = (justification_resp.choices[0].message.content or "").strip()
 
     parse_prompt = _build_ai_parse_prompt(card, justification)
-    parse_resp = client.chat.completions.create(
+    raw_json = chat_completion_text(
+        client,
+        api_base=route.api_base,
         model=model,
         messages=[
             {"role": "system", "content": "Return strict JSON only."},
             {"role": "user", "content": parse_prompt},
         ],
+        temperature=0.2,
+        max_tokens=512,
+        enable_thinking=False,
     )
-    raw_json = (parse_resp.choices[0].message.content or "").strip()
     parsed: dict[str, Any] = {}
     try:
         parsed = json.loads(raw_json)
@@ -323,17 +345,14 @@ def _openai_assisted_decision(
     return decision, justification, parsed
 
 
-def _openai_unavailable_reason() -> str:
-    """Human-readable explanation for why OpenAI path is unavailable."""
-    if OpenAI is None:
+def _llm_status_reason() -> str:
+    """Human-readable explanation for local vLLM availability."""
+    if httpx is None or vllm_route_from_env is None:
         return (
-            "OpenAI Python client is not importable (package missing or broken install). "
-            "Install/repair with: pip install openai"
+            "LLM client dependencies are not importable (httpx missing or broken install). "
+            "Install/repair with: pip install httpx"
         )
-    key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    if not key:
-        return "OPENAI_API_KEY is missing/empty in environment or .env."
-    return "OpenAI client initialized, but API request failed (auth/model/network/runtime)."
+    return llm_unavailable_reason()
 
 
 def _store_card(
@@ -478,15 +497,26 @@ def run_ranking_demo(cfg: RankingConfig) -> list[tuple[str, int]]:
     )
     _init_cards_table(pdb)
 
-    openai_client = None
-    openai_status_reason = _openai_unavailable_reason()
-    if OpenAI is not None and os.environ.get("OPENAI_API_KEY"):
+    llm_http_client = None
+    llm_route = None
+    llm_status_reason = _llm_status_reason()
+    if httpx is not None and vllm_route_from_env is not None:
         try:
-            openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-            openai_status_reason = "OpenAI client is available."
+            llm_route = vllm_route_from_env()
+            if llm_route is not None:
+                llm_http_client = httpx.Client()
+                if probe_vllm_route(llm_http_client, llm_route):
+                    llm_status_reason = "Local vLLM server is available."
+                else:
+                    llm_http_client.close()
+                    llm_http_client = None
+                    llm_route = None
         except Exception as e:
-            openai_client = None
-            openai_status_reason = f"OpenAI client init failed: {type(e).__name__}: {e}"
+            if llm_http_client is not None:
+                llm_http_client.close()
+            llm_http_client = None
+            llm_route = None
+            llm_status_reason = f"vLLM client init failed: {type(e).__name__}: {e}"
 
     all_pairs = list(itertools.combinations(contenders, 2))
     random.shuffle(all_pairs)
@@ -497,7 +527,7 @@ def run_ranking_demo(cfg: RankingConfig) -> list[tuple[str, int]]:
     print(f"\n[PAIRWISE] Total comparisons: {len(all_pairs)}")
     print(
         f"Decision split target: {len(all_pairs) - ai_pair_count} simulated-human "
-        f"+ {ai_pair_count} OpenAI-assisted"
+        f"+ {ai_pair_count} LLM-assisted"
     )
 
     for idx, (p1, p2) in enumerate(all_pairs):
@@ -511,23 +541,24 @@ def run_ranking_demo(cfg: RankingConfig) -> list[tuple[str, int]]:
             use_ai = raw in {"y", "yes"}
 
         if use_ai:
-            if openai_client is None:
+            if llm_http_client is None or llm_route is None:
                 print(
-                    "[AI] OpenAI unavailable; falling back to simulated-human decision. "
-                    f"Reason: {openai_status_reason}"
+                    "[AI] Local LLM unavailable; falling back to simulated-human decision. "
+                    f"Reason: {llm_status_reason}"
                 )
                 use_ai = False
             else:
-                print("[AI] User requested OpenAI help. Generating arguments for both players...")
+                print("[AI] User requested LLM help. Generating arguments for both players...")
                 try:
-                    decision, justification, parsed = _openai_assisted_decision(
+                    decision, justification, parsed = _llm_assisted_decision(
                         card=card,
-                        model=cfg.openai_model,
-                        client=openai_client,
+                        model=cfg.llm_model,
+                        client=llm_http_client,
+                        route=llm_route,
                     )
                 except Exception as e:
                     print(
-                        "[AI] OpenAI call failed; falling back to simulated-human decision. "
+                        "[AI] LLM call failed; falling back to simulated-human decision. "
                         f"Error: {type(e).__name__}: {e}"
                     )
                     chosen = p1 if elo[p1] >= elo[p2] else p2
@@ -555,7 +586,7 @@ def run_ranking_demo(cfg: RankingConfig) -> list[tuple[str, int]]:
                     go_with_ai = accept_raw not in {"n", "no"}
                 if go_with_ai:
                     chosen = decision
-                    source = "openai"
+                    source = "llm"
                     print(f"[DECISION] Going with AI decision: {chosen}")
                 else:
                     chosen = p1 if elo[p1] >= elo[p2] else p2
@@ -589,6 +620,8 @@ def run_ranking_demo(cfg: RankingConfig) -> list[tuple[str, int]]:
             extra={"rule": "higher_elo"},
         )
 
+    if llm_http_client is not None:
+        llm_http_client.close()
     pdb.close()
 
     final = sorted(contenders, key=lambda p: (scores[p], elo[p]), reverse=True)
@@ -603,14 +636,18 @@ def run_ranking_demo(cfg: RankingConfig) -> list[tuple[str, int]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Part 4 ranking demo: random contenders, player cards, pairwise ranking, optional OpenAI."
+        description="Part 4 ranking demo: random contenders, player cards, pairwise ranking, optional local LLM."
     )
     parser.add_argument("--start-date", default="2025-04-01")
     parser.add_argument("--end-date", default="2025-06-30")
     parser.add_argument("--top-n", type=int, default=30, help="Sample contenders from top N ELO players.")
     parser.add_argument("--contenders", type=int, default=5, help="How many contenders to rank.")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducibility.")
-    parser.add_argument("--openai-model", default="gpt-4o-mini")
+    parser.add_argument(
+        "--llm-model",
+        default="gemma-4-26B-A4B",
+        help="vLLM served model name",
+    )
     parser.add_argument("--interactive", action="store_true", help="Ask at each comparison whether to use AI.")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -621,7 +658,7 @@ def main() -> None:
         contenders_from_top_n=args.top_n,
         contenders_count=args.contenders,
         random_seed=args.seed,
-        openai_model=args.openai_model,
+        llm_model=args.llm_model,
         interactive=args.interactive,
         verbose=not args.quiet,
     )

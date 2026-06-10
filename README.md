@@ -14,7 +14,7 @@ Stack: **React 19 + Vite** (UI) and a **Python `http.server`** API (`tools/web_a
 |------|----------------|
 | **Home** | All-time or date-range rankings; recent events with job-based loading; optional “resolve coverage gaps” scrape. |
 | **Calendar** | Pick a day (Pacific) or browse “this week”; concluded vs upcoming cards. |
-| **PR Maker** | Quarter shortcuts, ELO-eligible event scrape, selective ingest, merges, OOR-aware comparisons, AI argument (OpenAI), markdown + CSV export. |
+| **PR Maker** | Quarter shortcuts, ELO-eligible event scrape, selective ingest, merges, OOR-aware comparisons, AI argument (local Gemma 4 via vLLM Metal), markdown + CSV export. |
 | **Debug** | Header toggle + left log shelf: client `fetch` logging, server-side events (poll), and page-specific debug lines (`localStorage` for the toggle). |
 
 ---
@@ -24,7 +24,7 @@ Stack: **React 19 + Vite** (UI) and a **Python `http.server`** API (`tools/web_a
 - **Node.js** 18+ (for Vite)
 - **Python** 3.11+ (3.10+ usually works)
 - **start.gg API token** — create one at [developer.start.gg](https://developer.start.gg/) and set `STARTGG_API_KEY`.
-- **OpenAI API key** — optional; required only for PR Maker “Generate argument”.
+- **vLLM Metal** with **google/gemma-4-26B-A4B** — optional; required only for PR Maker “Generate argument” and the ranking demo’s LLM-assisted comparisons. See [scheduler](https://github.com/shrutikmk/scheduler) for the same local stack pattern.
 
 ---
 
@@ -55,22 +55,78 @@ Edit **`.env`** at the **repository root** (next to this `README.md`). The API l
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `STARTGG_API_KEY` | **Yes** | All start.gg GraphQL usage. |
-| `OPENAI_API_KEY` | No | PR Maker AI comparison arguments only. |
+| `VLLM_14B_BASE_URL` | No | OpenAI-compatible vLLM root (e.g. `http://127.0.0.1:8000/v1`). Required for AI arguments. |
+| `VLLM_14B_MODEL` | No | Served model name (default `gemma-4-26B-A4B`; must match `--served-model-name`). |
+| `STARTGG_CONCURRENCY`, `STARTGG_SETS_PER_PAGE`, `STARTGG_MAX_RPM`, … | No | Scraping speed/limit tuning. See **[SCRAPING_PERFORMANCE.md](SCRAPING_PERFORMANCE.md)**. |
 
 Never commit `.env`, `keys.py`, or credential files. See `.gitignore` and `.env.example`.
+
+### Scraping performance
+
+Scraping is parallel and folds each set's players + scores into one paginated
+query (no per-set round-trips), turning typical PR Maker runs from **hours into
+minutes** while staying under start.gg's 80 req/60s and 1000-object limits.
+Re-runs on cached data cost ~0 API requests (per-event freshness checks), and
+hot endpoints (ELO tables, coverage, cache status) are memoized server-side so
+cached page loads land in well under a second. Tune or benchmark via
+**[SCRAPING_PERFORMANCE.md](SCRAPING_PERFORMANCE.md)** and
+`scripts/benchmark_scraping.py` (supports `--dry-run` to estimate cost without
+API calls); live counters are at `GET /api/metrics`. The full inefficiency →
+fix list lives in **[PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md)**.
+
+### Local LLM (vLLM Metal + Gemma 4)
+
+PR Maker “Generate argument” and the ranking demo call your **local vLLM** server (same pattern as the [scheduler](https://github.com/shrutikmk/scheduler) project). Download the model once:
+
+```bash
+mkdir -p ~/models
+export HF_HOME="$HOME/models/.hf-cache"
+hf download google/gemma-4-26B-A4B --local-dir "$HOME/models/gemma-4-26B-A4B"
+```
+
+Start vLLM in a separate terminal before using AI features:
+
+```bash
+vllm serve "$HOME/models/gemma-4-26B-A4B" --port 8000 \
+  --served-model-name gemma-4-26B-A4B --reasoning-parser gemma4
+```
+
+Set in `.env`:
+
+```bash
+VLLM_14B_BASE_URL=http://127.0.0.1:8000/v1
+VLLM_14B_MODEL=gemma-4-26B-A4B
+```
+
+Probe the server (loads repo-root `.env`):
+
+```bash
+python3 tools/llm_client.py --diagnose-only
+```
 
 ---
 
 ## Run locally (development)
 
-Use **two terminals**: API first, then the Vite dev server (proxies `/api` to the API).
+**One command (vLLM + API + Vite)** — same pattern as the [scheduler](https://github.com/shrutikmk/scheduler) local stack:
 
-**Terminal 1 — API (default `http://127.0.0.1:8765`)**
+```bash
+./scripts/pr-maker-local-stack.sh start   # background; logs under scripts/.pr-maker-stack/logs/
+./scripts/pr-maker-local-stack.sh status
+./scripts/pr-maker-local-stack.sh logs
+./scripts/pr-maker-local-stack.sh stop
+```
+
+Set `PR_MAKER_SKIP_VLLM=1` to require an external vLLM without auto-probing, or `PR_MAKER_SKIP_WEB=1` to start only vLLM + API. When the [scheduler](https://github.com/shrutikmk/scheduler) stack is already running, this script **reuses vLLM on port 8000** and binds the PR Maker API on **8775** (scheduler web UI uses 8765).
+
+**Manual (two terminals)** — API first, then the Vite dev server (proxies `/api` to the API).
+
+**Terminal 1 — API (default `http://127.0.0.1:8775`)**
 
 ```bash
 # From repo root (with venv activated)
 python3 tools/web_api.py
-# Optional: python3 tools/web_api.py --host 127.0.0.1 --port 8765
+# Optional: python3 tools/web_api.py --host 127.0.0.1 --port 8775
 ```
 
 **Terminal 2 — frontend**
@@ -96,15 +152,18 @@ Serve `web/dist/` with any static host; you must still run the Python API (or pu
 
 ```
 norcal-smash-pr-maker/
-├── requirements.txt     # Python deps (API + demo notebook)
+├── requirements.txt     # Python deps (API, demo notebook, pytest)
+├── scripts/             # pr-maker-local-stack.sh, port cleanup
 ├── web/                 # React app (Vite)
-├── tools/               # web_api.py, recent_events helpers, etc.
+├── tools/               # web_api.py, llm_client.py, recent_events helpers
 ├── demo/base_demo/      # ELO, scraper, processor, start.gg client (imported by API)
 ├── data/                # Created at runtime — gitignored (caches, DBs)
 └── .env                 # Local secrets — gitignored
 ```
 
 Runtime artifacts (SQLite DBs, tournament cache, OOR cache, etc.) live under **`data/`** and similar paths and are **ignored by git**.
+
+The out-of-region data pipeline (caching layers, fingerprints, warm jobs, tuning knobs, benchmarks) is documented in **[`docs/oor-pipeline.md`](docs/oor-pipeline.md)**.
 
 ---
 
@@ -123,11 +182,11 @@ Runtime artifacts (SQLite DBs, tournament cache, OOR cache, etc.) live under **`
 
 - **Do not** commit API keys, `.env`, `.env.local`, private keys, ad-hoc `keys.py`, or `credentials.json`.
 - The UI does not embed secrets; privileged calls go through your local API.
-- **`demo/base_demo/all-functions.ipynb`** loads `STARTGG_API_KEY` and `OPENAI_API_KEY` only from the environment or a **repo-root `.env`** (via `python-dotenv`). Do not reintroduce hardcoded tokens or `from keys import …` in tracked files.
+- **`demo/base_demo/all-functions.ipynb`** is an experimental prototype; production AI uses local vLLM via `tools/llm_client.py`. Load secrets only from environment or a **repo-root `.env`** (via `python-dotenv`). Do not reintroduce hardcoded tokens or `from keys import …` in tracked files.
 
 ### If a key was ever committed or shared
 
-Rotate it in the [start.gg](https://developer.start.gg/) / OpenAI dashboards. For leaked history on GitHub, use history rewriting ([`git filter-repo`](https://github.com/newren/git-filter-repo), BFG, etc.) in addition to rotation.
+Rotate it in the [start.gg](https://developer.start.gg/) dashboard. For leaked history on GitHub, use history rewriting ([`git filter-repo`](https://github.com/newren/git-filter-repo), BFG, etc.) in addition to rotation.
 
 ---
 

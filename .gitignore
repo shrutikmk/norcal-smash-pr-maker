@@ -60,3 +60,4 @@ cache/
 
 # ── Optional tooling ──────────────────────────────────────
 .eslintcache
+scripts/.pr-maker-stack/

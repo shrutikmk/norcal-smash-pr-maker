@@ -19,7 +19,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
@@ -45,15 +45,19 @@ try:
         _get_live_player_report, _upsert_live_player_report, StartGGClient,
         _build_player_opponent_records, CancelledOOR,
         fetch_oor_tournament_catalog, _fetch_player_sets_by_tournaments,
+        DEFAULT_PLAYER_DB,
     )
     from player_ranking import _build_player_card, _build_ai_justification_prompt, _loss_to_tournament_ratio  # type: ignore  # noqa: E402
+    from llm_client import complete_chat, llm_unavailable_reason  # type: ignore  # noqa: E402
     import tournament_processor as tp  # type: ignore  # noqa: E402
     from tournament_processor import ProcessorConfig  # type: ignore  # noqa: E402
     from tournament_scraper import (  # type: ignore  # noqa: E402
         ScraperConfig,
         compute_week_ranges_missing,
+        compute_week_ranges_to_fetch,
         scrape_tournaments,
     )
+    from startgg_rate_gate import get_request_count, get_metrics as _gate_get_metrics  # type: ignore  # noqa: E402
     import recent_events as recent_events_tool  # noqa: E402
     import tournament_scraper as _ts_mod  # noqa: E402
 except Exception as exc:  # pragma: no cover - environment dependency guard
@@ -71,6 +75,221 @@ PR_MAKER_SCRAPE_JOBS: dict[str, dict[str, Any]] = {}
 PR_MAKER_PROCESS_JOBS: dict[str, dict[str, Any]] = {}
 OOR_WARM_JOBS: dict[str, dict[str, Any]] = {}
 MIN_ENTRANTS = 16
+
+# --- Background cache warming ---------------------------------------------
+# Pre-warm recent tournaments on startup (and periodically) so the UI shows
+# data immediately instead of blocking on a cold scrape. Warming is incremental
+# (only missing / recent-stale weeks) and shares the rate gate with user jobs.
+WARM_RECENT_DAYS = 90          # initial + periodic recent window to keep fresh
+WARM_INTERVAL_SEC = 1800       # re-warm the recent window every 30 min
+WARM_BACKFILL_ENABLED = True   # also fill historical gaps once at low priority
+WARM_LOCK = Lock()
+WARM_STATE: dict[str, Any] = {
+    "enabled": True,
+    "phase": "idle",            # idle | warming-recent | backfill | sleeping | error
+    "inProgress": False,
+    "lastWarmedAt": None,        # unix seconds
+    "lastError": None,
+    "recentWindow": None,        # {"start","end"}
+    "runs": 0,
+    "lastRequestCount": None,    # start.gg requests issued by the last warm pass
+}
+# Set while a user-initiated scrape/process job runs, so warming pauses and the
+# user's request gets the rate-gate budget.
+_WARM_PAUSE = Lock()
+_warm_paused_depth = 0
+_warm_paused_lock = Lock()
+
+
+def _warm_pause_begin() -> None:
+    """Signal that a user-priority job started; warming should yield."""
+    global _warm_paused_depth
+    with _warm_paused_lock:
+        _warm_paused_depth += 1
+
+
+def _warm_pause_end() -> None:
+    global _warm_paused_depth
+    with _warm_paused_lock:
+        _warm_paused_depth = max(0, _warm_paused_depth - 1)
+
+
+def _warm_is_paused() -> bool:
+    with _warm_paused_lock:
+        return _warm_paused_depth > 0
+
+
+# --- Derived-data memoization -----------------------------------------------
+# ELO (and the sets it derives from) is pure a function of the SQLite caches, so
+# we memoize per request-context and invalidate via a cheap file stamp instead of
+# recomputing the full corpus on every request (homepage, every PR Maker POST).
+_MEMO_LOCK = Lock()
+_MEMO: dict[Any, tuple[Any, Any]] = {}   # key -> (data_stamp, value)
+_MEMO_MAX_ENTRIES = 16
+_MEMO_STATS = {"hits": 0, "misses": 0}
+
+
+def _db_stamp(*db_names: str) -> tuple:
+    """Cheap fingerprint of one or more data/*.db files (incl. WAL sidecars).
+
+    Changes whenever a writer commits, so memoized derived data (ELO, coverage)
+    invalidates automatically — including after CLI runs outside this process.
+    """
+    parts: list[tuple[int, int]] = []
+    for name in db_names:
+        for suffix in ("", "-wal"):
+            p = PROJECT_ROOT / "data" / f"{name}{suffix}"
+            try:
+                st = p.stat()
+                parts.append((st.st_mtime_ns, st.st_size))
+            except OSError:
+                parts.append((0, 0))
+    return tuple(parts)
+
+
+def _data_stamp() -> tuple:
+    return _db_stamp("processed_tournament.db", "tournament_cache.db")
+
+
+def _memoized(key: Any, compute: Any, *, stamp: tuple | None = None) -> Any:
+    """Return cached value for ``key`` if the data stamp is unchanged, else recompute."""
+    cur_stamp = stamp if stamp is not None else _data_stamp()
+    with _MEMO_LOCK:
+        ent = _MEMO.get(key)
+        if ent is not None and ent[0] == cur_stamp:
+            _MEMO_STATS["hits"] += 1
+            return ent[1]
+    value = compute()
+    with _MEMO_LOCK:
+        _MEMO_STATS["misses"] += 1
+        _MEMO[key] = (cur_stamp, value)
+        while len(_MEMO) > _MEMO_MAX_ENTRIES:
+            _MEMO.pop(next(iter(_MEMO)))
+    return value
+
+
+def _coverage_pct() -> float:
+    """Fraction of weeks from Ult release to today that are covered in cache.
+
+    Memoized on the tournament-cache stamp — `/api/cache/status` is polled by the
+    UI, and walking the full week ledger on every poll is wasted work.
+    """
+    def _compute() -> float:
+        try:
+            cache_path = PROJECT_ROOT / "data" / "tournament_cache.db"
+            start = ULT_RELEASE_DATE
+            end = date.today()
+            total_weeks = max(1, ((end - start).days // 7) + 1)
+            missing = compute_week_ranges_missing(
+                cache_path, game_filter=GAME_FILTER, start_date=start, end_date=end,
+            )
+            missing_weeks = sum(((b - a).days // 7) + 1 for a, b in missing)
+            return max(0.0, min(1.0, 1.0 - (missing_weeks / total_weeks)))
+        except Exception:
+            return 0.0
+
+    return _memoized(
+        ("coverage-pct", date.today().toordinal()),
+        _compute,
+        stamp=_db_stamp("tournament_cache.db"),
+    )
+
+
+def _warm_set(**fields: Any) -> None:
+    with WARM_LOCK:
+        WARM_STATE.update(fields)
+
+
+def _rate_gate_metrics() -> dict[str, float]:
+    try:
+        return _gate_get_metrics()
+    except Exception:
+        return {}
+
+
+def _warm_wait_if_paused(max_wait_sec: float = 120.0) -> None:
+    """Block briefly while a user-priority job holds the rate budget."""
+    waited = 0.0
+    while _warm_is_paused() and waited < max_wait_sec:
+        _time.sleep(1.0)
+        waited += 1.0
+
+
+def _warm_recent_window() -> None:
+    """Incrementally warm the trailing WARM_RECENT_DAYS window."""
+    end_d = date.today()
+    start_d = end_d - timedelta(days=WARM_RECENT_DAYS)
+    _warm_set(
+        phase="warming-recent",
+        inProgress=True,
+        recentWindow={"start": _date_to_str(start_d), "end": _date_to_str(end_d)},
+    )
+    req_before = get_request_count()
+    scrape_tournaments(
+        ScraperConfig(
+            start_date=_date_to_str(start_d),
+            end_date=_date_to_str(end_d),
+            game_filter=GAME_FILTER,
+            min_entrants=MIN_ENTRANTS,
+            regions=["bay", "sacramento"],
+            incremental=True,
+        ),
+        verbose=False,
+    )
+    used = get_request_count() - req_before
+    _warm_set(lastWarmedAt=int(_time.time()), lastRequestCount=used)
+    server_debug_log("info", "warm", f"recent window warmed ({WARM_RECENT_DAYS}d)", f"{used} requests")
+
+
+def _warm_backfill_gaps() -> None:
+    """Fill historical coverage gaps from Ult release, low priority."""
+    cache_path = PROJECT_ROOT / "data" / "tournament_cache.db"
+    missing = compute_week_ranges_missing(
+        cache_path, game_filter=GAME_FILTER, start_date=ULT_RELEASE_DATE, end_date=date.today(),
+    )
+    merged = _merge_contiguous_ranges(list(missing))
+    for sd, ed in merged:
+        _warm_wait_if_paused()
+        _warm_set(phase="backfill", recentWindow={"start": _date_to_str(sd), "end": _date_to_str(ed)})
+        scrape_tournaments(
+            ScraperConfig(
+                start_date=_date_to_str(sd),
+                end_date=_date_to_str(ed),
+                game_filter=GAME_FILTER,
+                min_entrants=MIN_ENTRANTS,
+                regions=["bay", "sacramento"],
+                incremental=True,
+            ),
+            verbose=False,
+        )
+        _warm_set(lastWarmedAt=int(_time.time()))
+
+
+def _warm_worker() -> None:
+    """Daemon: warm the recent window now + periodically; backfill gaps once."""
+    if _IMPORT_ERROR is not None:
+        _warm_set(enabled=False, phase="error", lastError=str(_IMPORT_ERROR))
+        return
+    if not os.environ.get("STARTGG_API_KEY"):
+        _warm_set(enabled=False, phase="idle", lastError="STARTGG_API_KEY not set; warming disabled")
+        server_debug_log("warn", "warm", "warming disabled: STARTGG_API_KEY not set")
+        return
+
+    backfilled = False
+    while True:
+        try:
+            _warm_wait_if_paused()
+            _warm_recent_window()
+            if WARM_BACKFILL_ENABLED and not backfilled:
+                _warm_backfill_gaps()
+                backfilled = True
+            with WARM_LOCK:
+                WARM_STATE["runs"] += 1
+            _warm_set(phase="sleeping", inProgress=False, lastError=None)
+        except Exception as exc:  # keep the daemon alive across transient errors
+            _warm_set(phase="error", inProgress=False, lastError=str(exc))
+            server_debug_log("error", "warm", "warm pass failed", str(exc))
+        _time.sleep(WARM_INTERVAL_SEC)
 
 # Ring buffer of recent server-side events for the web UI debug shelf (poll GET /api/debug/server-events).
 _SERVER_DEBUG_LOCK = Lock()
@@ -109,12 +328,91 @@ _OOR_CANCEL_LOCK = Lock()
 # OOR report cache (SQLite-backed, keyed by PR Maker context fingerprint)
 # ---------------------------------------------------------------------------
 _OOR_CACHE_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "oor_report_cache.db"
-_oor_cache_lock = Lock()
+# RLock (not Lock): cache helpers lock internally and some call sites also hold
+# the lock around multi-statement transactions.
+_oor_cache_lock = RLock()
+_oor_schema_ready = False
+
+# --- OOR observability counters (process lifetime; snapshot + diff per phase) ---
+_OOR_STATS_LOCK = Lock()
+_OOR_STATS: dict[str, int] = {
+    "report_mem_hits": 0,
+    "report_sqlite_hits": 0,
+    "report_rebuilds": 0,
+    "report_live_fetches": 0,
+    "set_history_hits": 0,
+    "set_history_misses": 0,
+    "standings_hits": 0,
+    "standings_misses": 0,
+    "tournament_result_hits": 0,
+    "tournament_result_misses": 0,
+}
+
+
+def _oor_stat(name: str, n: int = 1) -> None:
+    with _OOR_STATS_LOCK:
+        _OOR_STATS[name] = _OOR_STATS.get(name, 0) + n
+
+
+def _oor_stats_snapshot() -> dict[str, int]:
+    with _OOR_STATS_LOCK:
+        return dict(_OOR_STATS)
+
+
+# --- In-memory hot caches (fastest layer during an active PR Maker session) ---
+# Reports keyed by (ctx_hash, canonical_name); standings maps keyed by event_id.
+# Both are write-through over SQLite, so process restart only costs SQLite reads.
+_OOR_MEM_REPORTS: dict[tuple[str, str], dict[str, Any]] = {}
+_OOR_MEM_REPORTS_MAX = 2048
+_OOR_MEM_STANDINGS: dict[str, dict[str, Any]] = {}
+_OOR_MEM_STANDINGS_MAX = 4096
+_OOR_MEM_LOCK = Lock()
+
+
+def _mem_report_get(ctx_hash: str, name: str) -> dict[str, Any] | None:
+    with _OOR_MEM_LOCK:
+        return _OOR_MEM_REPORTS.get((ctx_hash, name))
+
+
+def _mem_report_put(ctx_hash: str, name: str, report: dict[str, Any]) -> None:
+    with _OOR_MEM_LOCK:
+        if len(_OOR_MEM_REPORTS) >= _OOR_MEM_REPORTS_MAX:
+            _OOR_MEM_REPORTS.pop(next(iter(_OOR_MEM_REPORTS)))
+        _OOR_MEM_REPORTS[(ctx_hash, name)] = report
+
+
+def _mem_report_drop(ctx_hash: str, name: str) -> None:
+    with _OOR_MEM_LOCK:
+        _OOR_MEM_REPORTS.pop((ctx_hash, name), None)
+
+
+def _mem_standings_get(event_id: str) -> dict[str, Any] | None:
+    with _OOR_MEM_LOCK:
+        return _OOR_MEM_STANDINGS.get(str(event_id))
+
+
+def _mem_standings_put(event_id: str, mapping: dict[str, Any]) -> None:
+    with _OOR_MEM_LOCK:
+        if len(_OOR_MEM_STANDINGS) >= _OOR_MEM_STANDINGS_MAX:
+            _OOR_MEM_STANDINGS.pop(next(iter(_OOR_MEM_STANDINGS)))
+        _OOR_MEM_STANDINGS[str(event_id)] = mapping
 
 
 def _oor_cache_conn() -> sqlite3.Connection:
+    global _oor_schema_ready
     _OOR_CACHE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_OOR_CACHE_DB_PATH), timeout=10)
+    # check_same_thread=False: one connection is shared by the fetch thread pool.
+    # All access goes through _oor_cache_lock (helpers lock internally), which
+    # fixes the silent ProgrammingError that previously disabled every granular
+    # cache read/write from pool workers (warm jobs, pair fetches).
+    conn = sqlite3.connect(str(_OOR_CACHE_DB_PATH), timeout=30, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.DatabaseError:
+        pass
+    if _oor_schema_ready:
+        return conn
     conn.execute("""
         CREATE TABLE IF NOT EXISTS live_report_cache (
             context_hash TEXT NOT NULL,
@@ -179,8 +477,8 @@ def _oor_cache_conn() -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS oor_tournament_result_cache (
             player_id TEXT NOT NULL,
-            tournament_id TEXT NOT NULL,
-            event_slug TEXT NOT NULL DEFAULT '',
+            event_slug TEXT NOT NULL,
+            tournament_id TEXT NOT NULL DEFAULT '',
             event_id TEXT NOT NULL DEFAULT '',
             tournament_name TEXT NOT NULL DEFAULT '',
             start_at INTEGER NOT NULL DEFAULT 0,
@@ -190,17 +488,76 @@ def _oor_cache_conn() -> sqlite3.Connection:
             notable_losses_json TEXT NOT NULL DEFAULT '[]',
             placement INTEGER,
             updated_at INTEGER NOT NULL,
-            PRIMARY KEY (player_id, tournament_id)
+            PRIMARY KEY (player_id, event_slug)
+        )
+    """)
+    _migrate_tournament_result_cache_schema(conn)
+    # Full standings map per event ({player_id: placement}); finished-event
+    # standings are immutable, so rows never expire. Shared by every player in
+    # the pool — replaces the old per-(event, player) standings rescans.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oor_event_standings_cache (
+            event_id TEXT NOT NULL PRIMARY KEY,
+            placements_json TEXT NOT NULL,
+            fetched_at INTEGER NOT NULL
         )
     """)
     conn.commit()
+    _oor_schema_ready = True
     return conn
+
+
+def _oor_get_event_standings(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None:
+    """Standings map for one event: memory layer first, then SQLite."""
+    eid = str(event_id)
+    cached = _mem_standings_get(eid)
+    if cached is not None:
+        return cached
+    with _oor_cache_lock:
+        row = conn.execute(
+            "SELECT placements_json FROM oor_event_standings_cache WHERE event_id = ?",
+            (eid,),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        mapping = json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+    _mem_standings_put(eid, mapping)
+    return mapping
+
+
+def _oor_put_event_standings(conn: sqlite3.Connection, event_id: str, mapping: dict[str, Any]) -> None:
+    eid = str(event_id)
+    _mem_standings_put(eid, mapping)
+    with _oor_cache_lock:
+        conn.execute(
+            """INSERT INTO oor_event_standings_cache (event_id, placements_json, fetched_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(event_id)
+               DO UPDATE SET placements_json = excluded.placements_json, fetched_at = excluded.fetched_at""",
+            (eid, json.dumps(mapping), int(_time.time())),
+        )
+        conn.commit()
+
+
+# Salt for context/window fingerprints. Bump when OOR derivation semantics
+# change so stale cached reports/set-histories are rebuilt instead of served:
+#   v2: online tournaments excluded from OOR aggregation (set nodes cached
+#       before v2 lack the isOnline fields and cannot be filtered).
+#   v3: per-event (event_slug) tournament-result cache — v2 keyed only by
+#       tournament_id and could apply a 2v2 shell result to singles.
+#   v4: singles-only OOR brackets; all-entrant set matching; stale bracket-
+#       bleed detection for cached event rows.
+_OOR_FINGERPRINT_VERSION = 4
 
 
 def _pr_maker_context_hash(
     start: str, end: str, event_slugs: list[str], merge_rules: list[dict[str, str]],
 ) -> str:
     blob = json.dumps({
+        "v": _OOR_FINGERPRINT_VERSION,
         "s": start, "e": end,
         "slugs": sorted(event_slugs),
         "merges": sorted(
@@ -212,15 +569,16 @@ def _pr_maker_context_hash(
 
 def _oor_window_hash(start: str, end: str) -> str:
     """Stable hash of the PR date window — used as the set-history cache partition."""
-    blob = f"{start}:{end}"
+    blob = f"v{_OOR_FINGERPRINT_VERSION}:{start}:{end}"
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
 def _cache_get_report(conn: sqlite3.Connection, ctx_hash: str, name: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        "SELECT report_json FROM live_report_cache WHERE context_hash = ? AND canonical_name = ?",
-        (ctx_hash, name),
-    ).fetchone()
+    with _oor_cache_lock:
+        row = conn.execute(
+            "SELECT report_json FROM live_report_cache WHERE context_hash = ? AND canonical_name = ?",
+            (ctx_hash, name),
+        ).fetchone()
     if row:
         try:
             return json.loads(row[0])
@@ -230,14 +588,16 @@ def _cache_get_report(conn: sqlite3.Connection, ctx_hash: str, name: str) -> dic
 
 
 def _cache_put_report(conn: sqlite3.Connection, ctx_hash: str, name: str, report: dict[str, Any]) -> None:
-    conn.execute(
-        """INSERT INTO live_report_cache (context_hash, canonical_name, report_json, updated_at)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(context_hash, canonical_name)
-           DO UPDATE SET report_json = excluded.report_json, updated_at = excluded.updated_at""",
-        (ctx_hash, name, json.dumps(report), int(_time.time())),
-    )
-    conn.commit()
+    with _oor_cache_lock:
+        conn.execute(
+            """INSERT INTO live_report_cache (context_hash, canonical_name, report_json, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(context_hash, canonical_name)
+               DO UPDATE SET report_json = excluded.report_json, updated_at = excluded.updated_at""",
+            (ctx_hash, name, json.dumps(report), int(_time.time())),
+        )
+        conn.commit()
+    _mem_report_put(ctx_hash, name, report)
 
 
 # ---------------------------------------------------------------------------
@@ -246,10 +606,11 @@ def _cache_put_report(conn: sqlite3.Connection, ctx_hash: str, name: str, report
 
 def _oor_fetch_state(conn: sqlite3.Connection, ctx_hash: str, name: str) -> str | None:
     """Return status ('pending', 'fetching', 'complete') or None if no row."""
-    row = conn.execute(
-        "SELECT status FROM oor_player_fetch_state WHERE context_hash = ? AND canonical_name = ?",
-        (ctx_hash, name),
-    ).fetchone()
+    with _oor_cache_lock:
+        row = conn.execute(
+            "SELECT status FROM oor_player_fetch_state WHERE context_hash = ? AND canonical_name = ?",
+            (ctx_hash, name),
+        ).fetchone()
     return row[0] if row else None
 
 
@@ -259,8 +620,9 @@ def _oor_upsert_event_row(
     name: str,
     ev: dict[str, Any],
 ) -> None:
-    conn.execute(
-        """INSERT INTO oor_event_row
+    with _oor_cache_lock:
+        conn.execute(
+            """INSERT INTO oor_event_row
            (context_hash, canonical_name, tournament_id, event_slug, event_id,
             tournament_name, start_at, wins, losses,
             notable_wins_json, notable_losses_json, placement, updated_at)
@@ -297,23 +659,30 @@ def _oor_set_fetch_state(
     total_pages: int,
     status: str,
 ) -> None:
-    conn.execute(
-        """INSERT INTO oor_player_fetch_state
-           (context_hash, canonical_name, pages_fetched, total_pages, status, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(context_hash, canonical_name)
-           DO UPDATE SET pages_fetched=excluded.pages_fetched, total_pages=excluded.total_pages,
-                         status=excluded.status, updated_at=excluded.updated_at""",
-        (ctx_hash, name, pages_fetched, total_pages, status, int(_time.time())),
-    )
-    conn.commit()
+    with _oor_cache_lock:
+        conn.execute(
+            """INSERT INTO oor_player_fetch_state
+               (context_hash, canonical_name, pages_fetched, total_pages, status, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(context_hash, canonical_name)
+               DO UPDATE SET pages_fetched=excluded.pages_fetched, total_pages=excluded.total_pages,
+                             status=excluded.status, updated_at=excluded.updated_at""",
+            (ctx_hash, name, pages_fetched, total_pages, status, int(_time.time())),
+        )
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
 # Context-independent OOR caches (keyed by player_id, not context_hash)
 # ---------------------------------------------------------------------------
 
-_OOR_SETS_CACHE_TTL = 604800  # 7 days (window-keyed cache; old 24h TTL no longer needed)
+# OOR set-history freshness threshold (window-keyed cache). Tunable: a longer
+# TTL means fewer refetches for historical PR windows; shorten it if the PR
+# window includes very recent events whose brackets may still be updating.
+try:
+    _OOR_SETS_CACHE_TTL = max(60, int(os.environ.get("OOR_SETS_TTL_SEC", "604800")))  # default 7 days
+except ValueError:
+    _OOR_SETS_CACHE_TTL = 604800
 
 
 def _oor_get_player_sets(
@@ -327,16 +696,17 @@ def _oor_get_player_sets(
     When *window_hash* is provided, looks up the v2 window-keyed table first.
     Falls back to the legacy table when no window_hash is given (backwards compat).
     """
-    if window_hash:
-        row = conn.execute(
-            "SELECT nodes_json, fetched_at FROM oor_player_sets_cache_v2 WHERE player_id = ? AND window_hash = ?",
-            (str(player_id), window_hash),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT nodes_json, fetched_at FROM oor_player_sets_cache WHERE player_id = ?",
-            (str(player_id),),
-        ).fetchone()
+    with _oor_cache_lock:
+        if window_hash:
+            row = conn.execute(
+                "SELECT nodes_json, fetched_at FROM oor_player_sets_cache_v2 WHERE player_id = ? AND window_hash = ?",
+                (str(player_id), window_hash),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT nodes_json, fetched_at FROM oor_player_sets_cache WHERE player_id = ?",
+                (str(player_id),),
+            ).fetchone()
     if not row:
         return None, 0
     fetched_at = int(row[1])
@@ -357,87 +727,131 @@ def _oor_put_player_sets(
     now = int(_time.time())
     nodes_blob = json.dumps(nodes)
     pid = str(player_id)
-    if window_hash:
+    with _oor_cache_lock:
+        if window_hash:
+            conn.execute(
+                """INSERT INTO oor_player_sets_cache_v2 (player_id, window_hash, nodes_json, fetched_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(player_id, window_hash)
+                   DO UPDATE SET nodes_json = excluded.nodes_json, fetched_at = excluded.fetched_at""",
+                (pid, window_hash, nodes_blob, now),
+            )
+        # Always update legacy table too so non-window-aware code paths stay warm.
         conn.execute(
-            """INSERT INTO oor_player_sets_cache_v2 (player_id, window_hash, nodes_json, fetched_at)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(player_id, window_hash)
+            """INSERT INTO oor_player_sets_cache (player_id, nodes_json, fetched_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(player_id)
                DO UPDATE SET nodes_json = excluded.nodes_json, fetched_at = excluded.fetched_at""",
-            (pid, window_hash, nodes_blob, now),
+            (pid, nodes_blob, now),
         )
-    # Always update legacy table too so non-window-aware code paths stay warm.
-    conn.execute(
-        """INSERT INTO oor_player_sets_cache (player_id, nodes_json, fetched_at)
-           VALUES (?, ?, ?)
-           ON CONFLICT(player_id)
-           DO UPDATE SET nodes_json = excluded.nodes_json, fetched_at = excluded.fetched_at""",
-        (pid, nodes_blob, now),
-    )
+        conn.commit()
+
+
+def _migrate_tournament_result_cache_schema(conn: sqlite3.Connection) -> None:
+    """One-time migration from (player_id, tournament_id) PK to (player_id, event_slug)."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='oor_tournament_result_cache'",
+    ).fetchone()
+    ddl = (row[0] or "") if row else ""
+    if not ddl or "PRIMARY KEY (player_id, event_slug)" in ddl.replace("\n", " "):
+        return
+    conn.execute("ALTER TABLE oor_tournament_result_cache RENAME TO _oor_tourney_result_legacy")
+    conn.execute("""
+        CREATE TABLE oor_tournament_result_cache (
+            player_id TEXT NOT NULL,
+            event_slug TEXT NOT NULL,
+            tournament_id TEXT NOT NULL DEFAULT '',
+            event_id TEXT NOT NULL DEFAULT '',
+            tournament_name TEXT NOT NULL DEFAULT '',
+            start_at INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            notable_wins_json TEXT NOT NULL DEFAULT '[]',
+            notable_losses_json TEXT NOT NULL DEFAULT '[]',
+            placement INTEGER,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (player_id, event_slug)
+        )
+    """)
+    conn.execute("""
+        INSERT OR IGNORE INTO oor_tournament_result_cache
+        SELECT player_id, event_slug, tournament_id, event_id, tournament_name, start_at,
+               wins, losses, notable_wins_json, notable_losses_json, placement, updated_at
+        FROM _oor_tourney_result_legacy
+        WHERE event_slug != ''
+    """)
+    conn.execute("DROP TABLE _oor_tourney_result_legacy")
     conn.commit()
 
 
-def _oor_get_tournament_result(conn: sqlite3.Connection, player_id: str, tournament_id: str) -> dict[str, Any] | None:
-    row = conn.execute(
-        """SELECT event_slug, event_id, tournament_name, start_at,
-                  wins, losses, notable_wins_json, notable_losses_json, placement
-           FROM oor_tournament_result_cache
-           WHERE player_id = ? AND tournament_id = ?""",
-        (str(player_id), str(tournament_id)),
-    ).fetchone()
+def _oor_get_tournament_result(conn: sqlite3.Connection, player_id: str, event_slug: str) -> dict[str, Any] | None:
+    with _oor_cache_lock:
+        row = conn.execute(
+            """SELECT event_slug, event_id, tournament_id, tournament_name, start_at,
+                      wins, losses, notable_wins_json, notable_losses_json, placement
+               FROM oor_tournament_result_cache
+               WHERE player_id = ? AND event_slug = ?""",
+            (str(player_id), str(event_slug)),
+        ).fetchone()
     if not row:
         return None
     return {
         "event_slug": row[0],
         "event_id": row[1],
-        "tournament_name": row[2],
-        "start_at": row[3],
-        "wins": row[4],
-        "losses": row[5],
-        "notable_wins": json.loads(row[6]) if row[6] else [],
-        "notable_losses": json.loads(row[7]) if row[7] else [],
-        "placement": row[8],
-        "tournament_id": str(tournament_id),
+        "tournament_id": row[2],
+        "tournament_name": row[3],
+        "start_at": row[4],
+        "wins": row[5],
+        "losses": row[6],
+        "notable_wins": json.loads(row[7]) if row[7] else [],
+        "notable_losses": json.loads(row[8]) if row[8] else [],
+        "placement": row[9],
     }
 
 
-def _oor_put_tournament_result(conn: sqlite3.Connection, player_id: str, tournament_id: str, result: dict[str, Any]) -> None:
-    conn.execute(
-        """INSERT INTO oor_tournament_result_cache
-           (player_id, tournament_id, event_slug, event_id, tournament_name, start_at,
-            wins, losses, notable_wins_json, notable_losses_json, placement, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(player_id, tournament_id)
-           DO UPDATE SET event_slug=excluded.event_slug, event_id=excluded.event_id,
-                         tournament_name=excluded.tournament_name, start_at=excluded.start_at,
-                         wins=excluded.wins, losses=excluded.losses,
-                         notable_wins_json=excluded.notable_wins_json,
-                         notable_losses_json=excluded.notable_losses_json,
-                         placement=excluded.placement, updated_at=excluded.updated_at""",
-        (
-            str(player_id), str(tournament_id),
-            str(result.get("event_slug", "")),
-            str(result.get("event_id", "")),
-            str(result.get("tournament_name", "")),
-            int(result.get("start_at", 0)),
-            int(result.get("wins", 0)),
-            int(result.get("losses", 0)),
-            json.dumps(result.get("notable_wins", [])),
-            json.dumps(result.get("notable_losses", [])),
-            result.get("placement"),
-            int(_time.time()),
-        ),
-    )
-    conn.commit()
+def _oor_put_tournament_result(conn: sqlite3.Connection, player_id: str, event_slug: str, result: dict[str, Any]) -> None:
+    slug = str(event_slug or result.get("event_slug") or "")
+    if not slug:
+        return
+    with _oor_cache_lock:
+        conn.execute(
+            """INSERT INTO oor_tournament_result_cache
+               (player_id, event_slug, tournament_id, event_id, tournament_name, start_at,
+                wins, losses, notable_wins_json, notable_losses_json, placement, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(player_id, event_slug)
+               DO UPDATE SET tournament_id=excluded.tournament_id, event_id=excluded.event_id,
+                             tournament_name=excluded.tournament_name, start_at=excluded.start_at,
+                             wins=excluded.wins, losses=excluded.losses,
+                             notable_wins_json=excluded.notable_wins_json,
+                             notable_losses_json=excluded.notable_losses_json,
+                             placement=excluded.placement, updated_at=excluded.updated_at""",
+            (
+                str(player_id), slug,
+                str(result.get("tournament_id", "")),
+                str(result.get("event_id", "")),
+                str(result.get("tournament_name", "")),
+                int(result.get("start_at", 0)),
+                int(result.get("wins", 0)),
+                int(result.get("losses", 0)),
+                json.dumps(result.get("notable_wins", [])),
+                json.dumps(result.get("notable_losses", [])),
+                result.get("placement"),
+                int(_time.time()),
+            ),
+        )
+        conn.commit()
 
 
 _OOR_CATALOG_TTL = 604800  # 7 days
 
 
 def _oor_get_tournament_catalog(conn: sqlite3.Connection, window_hash: str) -> list[str] | None:
-    row = conn.execute(
-        "SELECT tournament_ids_json, fetched_at FROM oor_tournament_catalog WHERE window_hash = ?",
-        (window_hash,),
-    ).fetchone()
+    with _oor_cache_lock:
+        row = conn.execute(
+            "SELECT tournament_ids_json, fetched_at FROM oor_tournament_catalog WHERE window_hash = ?",
+            (window_hash,),
+        ).fetchone()
     if not row:
         return None
     fetched_at = int(row[1])
@@ -450,14 +864,15 @@ def _oor_get_tournament_catalog(conn: sqlite3.Connection, window_hash: str) -> l
 
 
 def _oor_put_tournament_catalog(conn: sqlite3.Connection, window_hash: str, tournament_ids: list[str]) -> None:
-    conn.execute(
-        """INSERT INTO oor_tournament_catalog (window_hash, tournament_ids_json, fetched_at)
-           VALUES (?, ?, ?)
-           ON CONFLICT(window_hash)
-           DO UPDATE SET tournament_ids_json = excluded.tournament_ids_json, fetched_at = excluded.fetched_at""",
-        (window_hash, json.dumps(tournament_ids), int(_time.time())),
-    )
-    conn.commit()
+    with _oor_cache_lock:
+        conn.execute(
+            """INSERT INTO oor_tournament_catalog (window_hash, tournament_ids_json, fetched_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(window_hash)
+               DO UPDATE SET tournament_ids_json = excluded.tournament_ids_json, fetched_at = excluded.fetched_at""",
+            (window_hash, json.dumps(tournament_ids), int(_time.time())),
+        )
+        conn.commit()
 
 
 def _dq_filtered_attendance_counts(sets: list[dict[str, Any]]) -> dict[str, int]:
@@ -496,6 +911,256 @@ def _dq_filtered_in_region_tournament_count(player_sets: list[dict[str, Any]], n
     return sum(1 for v in flags.values() if v)
 
 
+def _is_empty_report(report: dict[str, Any]) -> bool:
+    """True for failed-fetch / identity-miss placeholders with no real stats."""
+    if report.get("in_region_placements") or report.get("out_region_placements"):
+        return False
+    return (
+        int(report.get("in_region_tournaments", 0) or 0) == 0
+        and int(report.get("in_region_wins", 0) or 0) == 0
+        and int(report.get("in_region_losses", 0) or 0) == 0
+        and int(report.get("out_region_tournaments", 0) or 0) == 0
+        and int(report.get("out_region_wins", 0) or 0) == 0
+        and int(report.get("out_region_losses", 0) or 0) == 0
+    )
+
+
+def _oor_stats_empty(report: dict[str, Any]) -> bool:
+    return (
+        int(report.get("out_region_tournaments", 0) or 0) == 0
+        and int(report.get("out_region_wins", 0) or 0) == 0
+        and int(report.get("out_region_losses", 0) or 0) == 0
+        and not report.get("out_region_placements")
+    )
+
+
+def _oor_event_row_count(conn: sqlite3.Connection, ctx_hash: str, name: str) -> int:
+    with _oor_cache_lock:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM oor_event_row WHERE context_hash = ? AND canonical_name = ?",
+            (ctx_hash, name),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _oor_event_rows_all_empty_shells(conn: sqlite3.Connection, ctx_hash: str, name: str) -> bool:
+    """True when every cached event row has 0 W-L and no notables."""
+    with _oor_cache_lock:
+        rows = conn.execute(
+            """SELECT wins, losses, notable_wins_json, notable_losses_json
+               FROM oor_event_row
+               WHERE context_hash = ? AND canonical_name = ?""",
+            (ctx_hash, name),
+        ).fetchall()
+    if not rows:
+        return False
+    for w, l, nw_json, nl_json in rows:
+        if int(w or 0) > 0 or int(l or 0) > 0:
+            return False
+        nw = json.loads(nw_json) if nw_json else []
+        nl = json.loads(nl_json) if nl_json else []
+        if nw or nl:
+            return False
+    return True
+
+
+def _oor_event_rows_stale(conn: sqlite3.Connection, ctx_hash: str, name: str) -> bool:
+    """True when cached granular rows should not be trusted and a live refetch is needed.
+
+    Covers empty shells from old tournament_id-keyed cache bugs and bracket bleed
+    where identical W-L/notables were copied across singles + doubles at one event.
+    """
+    if _oor_event_rows_all_empty_shells(conn, ctx_hash, name):
+        return True
+    with _oor_cache_lock:
+        rows = conn.execute(
+            """SELECT tournament_id, event_slug, wins, losses,
+                      notable_wins_json, notable_losses_json
+               FROM oor_event_row
+               WHERE context_hash = ? AND canonical_name = ?""",
+            (ctx_hash, name),
+        ).fetchall()
+    by_tid: dict[str, list[tuple[str, int, int, str, str]]] = {}
+    for tid, slug, w, l, nw_json, nl_json in rows:
+        by_tid.setdefault(str(tid), []).append((
+            str(slug or ""),
+            int(w or 0),
+            int(l or 0),
+            str(nw_json or "[]"),
+            str(nl_json or "[]"),
+        ))
+    for group in by_tid.values():
+        if len(group) < 2:
+            continue
+        signatures = {(w, l, nw, nl) for _, w, l, nw, nl in group}
+        if len(signatures) != 1:
+            continue
+        w, l, _, _ = next(iter(signatures))
+        if w + l == 0:
+            continue
+        slugs = [slug for slug, *_ in group]
+        has_singles = any("singles" in s.casefold() and "doubles" not in s.casefold() and "2v2" not in s.casefold() for s in slugs)
+        has_doubles = any("doubles" in s.casefold() or "2v2" in s.casefold() for s in slugs)
+        if has_singles and has_doubles:
+            return True
+        if len(group) > 1:
+            return True
+    return False
+
+
+def _player_id_for_name(name: str) -> str:
+    """Best-effort player_id lookup from the local identity DB (no network)."""
+    db_path = DEFAULT_PLAYER_DB
+    if not db_path.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        rows = conn.execute(
+            "SELECT canonical_name, player_id FROM player_identity "
+            "WHERE player_id IS NOT NULL AND player_id != ''",
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return ""
+    for cname, pid in rows:
+        if cname == name:
+            return str(pid)
+    name_cf = name.casefold()
+    for cname, pid in rows:
+        if cname.casefold() == name_cf:
+            return str(pid)
+    def _tag(n: str) -> str:
+        return n.split("|")[-1].strip() if "|" in n else n.strip()
+    tag = _tag(name).casefold()
+    if tag:
+        for cname, pid in rows:
+            if _tag(cname).casefold() == tag:
+                return str(pid)
+    return ""
+
+
+def _apply_standings_cache_to_placements(
+    placements: list[dict[str, Any]],
+    player_id: str,
+    cache_conn: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Fill missing in-region placements from the shared event-standings cache."""
+    pid = str(player_id or "")
+    if not pid:
+        return placements
+    out: list[dict[str, Any]] = []
+    for row in placements:
+        rec = dict(row)
+        if rec.get("placement") is None:
+            eid = str(rec.get("event_id") or "")
+            if eid:
+                try:
+                    smap = _oor_get_event_standings(cache_conn, eid)
+                except Exception:
+                    smap = None
+                if smap is not None:
+                    pl = smap.get(pid)
+                    if isinstance(pl, int):
+                        rec["placement"] = pl
+        out.append(rec)
+    return out
+
+
+def _in_region_placements_incomplete(
+    report: dict[str, Any],
+    name: str,
+    sets: list[dict[str, Any]],
+) -> bool:
+    """True when the player has in-region sets but any resolvable event lacks placement."""
+    player_slugs: set[str] = set()
+    event_ids_by_slug: dict[str, str] = {}
+    for s in sets:
+        if s["p1"] != name and s["p2"] != name:
+            continue
+        slug = str(s.get("event_slug") or "")
+        if not slug:
+            continue
+        player_slugs.add(slug)
+        eid = str(s.get("event_id") or "")
+        if eid:
+            event_ids_by_slug[slug] = eid
+    if not player_slugs:
+        return False
+    placements_by_slug = {
+        str(p.get("event_slug", "")): p.get("placement")
+        for p in (report.get("in_region_placements") or [])
+    }
+    for slug in player_slugs:
+        if slug not in event_ids_by_slug:
+            continue
+        if not isinstance(placements_by_slug.get(slug), int):
+            return True
+    return False
+
+
+def _refresh_in_region_stats(
+    report: dict[str, Any],
+    name: str,
+    sets: list[dict[str, Any]],
+    *,
+    cache_conn: sqlite3.Connection | None = None,
+    player_id: str | None = None,
+) -> dict[str, Any]:
+    """Recompute in-region counters from the current PR Maker set pool.
+
+    Cached OOR reports may have been stored before sets were processed, or as
+    empty shells after a failed identity lookup. In-region stats are always
+    derivable locally — never trust a cache row for them.
+    """
+    player_sets = [s for s in sets if s["p1"] == name or s["p2"] == name]
+    in_wins = in_losses = 0
+    seen_events: dict[str, dict[str, Any]] = {}
+    for s in player_sets:
+        won = (s["p1"] == name and s["p1_score"] > s["p2_score"]) or \
+              (s["p2"] == name and s["p2_score"] > s["p1_score"])
+        if won:
+            in_wins += 1
+        else:
+            in_losses += 1
+        slug = s["event_slug"]
+        if slug not in seen_events:
+            seen_events[slug] = {
+                "tournament_id": s.get("tournament_id", ""),
+                "tournament_name": s.get("tournament_name", ""),
+                "event_slug": slug,
+                "event_id": str(s.get("event_id") or ""),
+                "wins": 0,
+                "losses": 0,
+            }
+        rec = seen_events[slug]
+        if won:
+            rec["wins"] += 1
+        else:
+            rec["losses"] += 1
+
+    old_placements = {
+        str(p.get("event_slug", "")): p.get("placement")
+        for p in (report.get("in_region_placements") or [])
+    }
+    in_region_placements = [
+        {**rec, "placement": old_placements.get(slug)}
+        for slug, rec in seen_events.items()
+    ]
+    if cache_conn is not None:
+        pid = player_id if player_id is not None else _player_id_for_name(name)
+        in_region_placements = _apply_standings_cache_to_placements(
+            in_region_placements, pid, cache_conn,
+        )
+
+    out = dict(report)
+    out["canonical_name"] = name
+    out["in_region_tournaments"] = _dq_filtered_in_region_tournament_count(player_sets, name)
+    out["in_region_wins"] = in_wins
+    out["in_region_losses"] = in_losses
+    out["in_region_placements"] = in_region_placements
+    return out
+
+
 def _oor_rebuild_report_from_rows(
     conn: sqlite3.Connection,
     ctx_hash: str,
@@ -522,6 +1187,7 @@ def _oor_rebuild_report_from_rows(
                 "tournament_id": s.get("tournament_id", ""),
                 "tournament_name": s.get("tournament_name", ""),
                 "event_slug": slug,
+                "event_id": str(s.get("event_id") or ""),
                 "wins": 0, "losses": 0,
             }
         rec = seen_events[slug]
@@ -533,14 +1199,15 @@ def _oor_rebuild_report_from_rows(
     for slug, rec in seen_events.items():
         in_region_placements.append({**rec, "placement": None})
 
-    rows = conn.execute(
-        """SELECT tournament_id, event_slug, event_id, tournament_name, start_at,
-                  wins, losses, notable_wins_json, notable_losses_json, placement
-           FROM oor_event_row
-           WHERE context_hash = ? AND canonical_name = ?
-           ORDER BY start_at DESC""",
-        (ctx_hash, name),
-    ).fetchall()
+    with _oor_cache_lock:
+        rows = conn.execute(
+            """SELECT tournament_id, event_slug, event_id, tournament_name, start_at,
+                      wins, losses, notable_wins_json, notable_losses_json, placement
+               FROM oor_event_row
+               WHERE context_hash = ? AND canonical_name = ?
+               ORDER BY start_at DESC""",
+            (ctx_hash, name),
+        ).fetchall()
 
     out_tournaments: set[str] = set()
     out_wins = out_losses = 0
@@ -558,8 +1225,10 @@ def _oor_rebuild_report_from_rows(
         all_notable_losses.extend(nl)
         out_region_placements.append({
             "tournament_id": tid, "tournament_name": tname,
-            "event_slug": eslug, "placement": pl,
+            "event_slug": eslug, "event_id": eid, "start_at": start_at,
+            "placement": pl,
             "wins": w, "losses": l,
+            "notable_wins": nw, "notable_losses": nl,
         })
 
     def top_counts(names_list: list[str], limit: int = 10) -> list[tuple[str, int]]:
@@ -626,7 +1295,8 @@ def _merge_contiguous_ranges(ranges: list[tuple[date, date]]) -> list[tuple[date
     return out
 
 
-def _coverage_resolve_worker(job_id: str, ranges_payload: list[dict[str, str]]) -> None:
+def _coverage_resolve_worker(job_id: str, ranges_payload: list[dict[str, str]], *, force_refresh: bool = False) -> None:
+    _warm_pause_begin()
     try:
         _ensure_runtime_deps()
         cache_path = PROJECT_ROOT / "data" / "tournament_cache.db"
@@ -668,6 +1338,8 @@ def _coverage_resolve_worker(job_id: str, ranges_payload: list[dict[str, str]]) 
                     game_filter=GAME_FILTER,
                     min_entrants=16,
                     regions=["bay", "sacramento"],
+                    incremental=not force_refresh,
+                    force_refresh=force_refresh,
                 ),
                 verbose=False,
             )
@@ -690,6 +1362,8 @@ def _coverage_resolve_worker(job_id: str, ranges_payload: list[dict[str, str]]) 
         with JOB_LOCK:
             COVERAGE_RESOLVE_JOBS[job_id]["status"] = "error"
             COVERAGE_RESOLVE_JOBS[job_id]["error"] = str(exc)
+    finally:
+        _warm_pause_end()
 
 
 def _filter_and_rank(
@@ -724,6 +1398,7 @@ def _build_elo_payload(
     end_date: str | None,
     query: str,
     max_players: int,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     _ensure_runtime_deps()
     if mode not in {"all-time", "date-range"}:
@@ -743,8 +1418,14 @@ def _build_elo_payload(
             game_filter=GAME_FILTER,
             min_entrants=16,
             regions=["bay", "sacramento"],
+            incremental=not force_refresh,
+            force_refresh=force_refresh,
         )
-        scrape_tournaments(scrape_cfg, verbose=False)
+        _warm_pause_begin()
+        try:
+            scrape_tournaments(scrape_cfg, verbose=False)
+        finally:
+            _warm_pause_end()
 
         _process_tournaments_with_progress(
             ProcessorConfig(
@@ -756,11 +1437,10 @@ def _build_elo_payload(
             progress_cb=None,
         )
 
-        elo_cfg = EloConfig(
-            start_date=_date_to_str(start_d),
-            end_date=_date_to_str(end_d),
+        elo = _memoized(
+            ("elo-range", _date_to_str(start_d), _date_to_str(end_d)),
+            lambda: compute_elo(EloConfig(start_date=_date_to_str(start_d), end_date=_date_to_str(end_d)))[0],
         )
-        elo, _ = compute_elo(elo_cfg)
         rows, total_players = _filter_and_rank(elo, query=query, max_players=max_players)
         return {
             "mode": mode,
@@ -771,7 +1451,9 @@ def _build_elo_payload(
             "missingRanges": [],
         }
 
-    elo, _ = compute_elo(EloConfig(start_date=None, end_date=None))
+    # All-time ELO is a pure function of the processed corpus — memoize it so
+    # repeat homepage loads are instant until new data lands.
+    elo = _memoized(("elo-all-time",), lambda: compute_elo(EloConfig(start_date=None, end_date=None))[0])
     rows, total_players = _filter_and_rank(elo, query=query, max_players=max_players)
     missing = compute_week_ranges_missing(
         PROJECT_ROOT / "data" / "tournament_cache.db",
@@ -890,6 +1572,38 @@ def _fetch_tournaments_for_window(
     out = list(out_by_id.values())
     out.sort(key=lambda row: int(row.get("startAt") or 0))
     return out
+
+
+# Calendar cards hit live start.gg with a per-tournament fan-out; cache briefly
+# so navigating between days/weeks doesn't repeat the whole fetch.
+_CALENDAR_CACHE_TTL_SEC = 600
+_calendar_cache_lock = Lock()
+_calendar_cache: dict[tuple, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _build_calendar_cards_cached(
+    *,
+    target_start: date,
+    target_end: date,
+    sample_registrants: int,
+) -> list[dict[str, Any]]:
+    key = (target_start.toordinal(), target_end.toordinal(), sample_registrants)
+    now = _time.time()
+    with _calendar_cache_lock:
+        ent = _calendar_cache.get(key)
+        if ent is not None and now - ent[0] < _CALENDAR_CACHE_TTL_SEC:
+            return ent[1]
+    cards = _build_calendar_cards(
+        target_start=target_start,
+        target_end=target_end,
+        sample_registrants=sample_registrants,
+    )
+    with _calendar_cache_lock:
+        _calendar_cache[key] = (now, cards)
+        if len(_calendar_cache) > 32:
+            oldest = min(_calendar_cache, key=lambda k: _calendar_cache[k][0])
+            _calendar_cache.pop(oldest, None)
+    return cards
 
 
 def _build_calendar_cards(
@@ -1029,26 +1743,37 @@ def _pr_maker_merged_sets_and_elo(
     event_slugs: list[str],
     merge_rules: list[dict[str, str]],
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
-    """Load in-region sets scoped to event_slugs, apply merges, compute ELO."""
-    cfg = EloConfig(
-        start_date=start_iso or None,
-        end_date=end_iso or None,
-        include_event_slugs=set(event_slugs),
-    )
-    sets = _load_in_region_sets(cfg)
-    for rule in merge_rules:
-        keep = str(rule.get("keep", ""))
-        drop = str(rule.get("drop", ""))
-        if not keep or not drop or keep == drop:
-            continue
-        for s in sets:
-            if s["p1"] == drop:
-                s["p1"] = keep
-            if s["p2"] == drop:
-                s["p2"] = keep
-        sets = [s for s in sets if s["p1"] != s["p2"]]
-    elo = _compute_elo_from_sets(sets, k_factor=cfg.k_factor, initial_elo=cfg.initial_elo)
-    return sets, elo
+    """Load in-region sets scoped to event_slugs, apply merges, compute ELO.
+
+    Memoized per PR Maker context (date window + slugs + merges) and invalidated
+    by the processed-DB stamp: every PR Maker endpoint needs this pair, and
+    recomputing it from SQLite on each request was the dominant per-click cost.
+    Callers must treat the returned list/dict as read-only.
+    """
+    ctx_key = ("pr-sets-elo", _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules))
+
+    def _compute() -> tuple[list[dict[str, Any]], dict[str, float]]:
+        cfg = EloConfig(
+            start_date=start_iso or None,
+            end_date=end_iso or None,
+            include_event_slugs=set(event_slugs),
+        )
+        sets = _load_in_region_sets(cfg)
+        for rule in merge_rules:
+            keep = str(rule.get("keep", ""))
+            drop = str(rule.get("drop", ""))
+            if not keep or not drop or keep == drop:
+                continue
+            for s in sets:
+                if s["p1"] == drop:
+                    s["p1"] = keep
+                if s["p2"] == drop:
+                    s["p2"] = keep
+            sets = [s for s in sets if s["p1"] != s["p2"]]
+        elo = _compute_elo_from_sets(sets, k_factor=cfg.k_factor, initial_elo=cfg.initial_elo)
+        return sets, elo
+
+    return _memoized(ctx_key, _compute)
 
 
 def _empty_report(name: str) -> dict[str, Any]:
@@ -1077,33 +1802,38 @@ _CSV_LIST_SEP = " | "
 
 
 def _pool_copeland_scores(names: list[str], sets: list[dict[str, Any]]) -> dict[str, float]:
-    """Copeland-style score from in-region sets among this name list (not PR Maker comparison clicks)."""
+    """Copeland-style score from in-region sets among this name list (not PR Maker comparison clicks).
+
+    Single pass over the sets to build per-pair win counts, then O(n²) over pairs
+    — the old version rescanned every set for every pair (O(n² × sets)).
+    """
     pool = set(names)
     scores: dict[str, float] = {n: 0.0 for n in names}
+    # (min_name, max_name) -> [wins_for_min, wins_for_max]
+    pair_wins: dict[tuple[str, str], list[int]] = {}
+    for s in sets:
+        p1, p2 = s.get("p1"), s.get("p2")
+        if p1 not in pool or p2 not in pool or p1 == p2:
+            continue
+        s1 = int(s.get("p1_score", 0) or 0)
+        s2 = int(s.get("p2_score", 0) or 0)
+        if s1 == s2:
+            continue
+        winner = p1 if s1 > s2 else p2
+        key = (p1, p2) if p1 < p2 else (p2, p1)
+        rec = pair_wins.setdefault(key, [0, 0])
+        rec[0 if winner == key[0] else 1] += 1
+
     ordered = list(names)
     for i in range(len(ordered)):
         a = ordered[i]
         for j in range(i + 1, len(ordered)):
             b = ordered[j]
-            aw, bw = 0, 0
-            for s in sets:
-                p1, p2 = s.get("p1"), s.get("p2")
-                if p1 not in pool or p2 not in pool:
-                    continue
-                if {p1, p2} != {a, b}:
-                    continue
-                s1 = int(s.get("p1_score", 0) or 0)
-                s2 = int(s.get("p2_score", 0) or 0)
-                if s1 > s2:
-                    if p1 == a:
-                        aw += 1
-                    else:
-                        bw += 1
-                elif s2 > s1:
-                    if p2 == a:
-                        aw += 1
-                    else:
-                        bw += 1
+            key = (a, b) if a < b else (b, a)
+            rec = pair_wins.get(key)
+            if not rec:
+                continue
+            aw, bw = (rec[0], rec[1]) if a == key[0] else (rec[1], rec[0])
             if aw > bw:
                 scores[a] += 1.0
             elif bw > aw:
@@ -1187,6 +1917,106 @@ def _dedupe_preserve_order(names: Any) -> list[str]:
     return out
 
 
+def _oor_env_int(name: str, default: int, *, lo: int = 1, hi: int = 16) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return max(lo, min(hi, int(raw)))
+    except ValueError:
+        return default
+
+
+# Tuning knobs (env): how many players are fetched in parallel for user-facing
+# requests vs. background warm jobs. The shared rate gate still caps aggregate
+# request rate, so these trade latency against fairness with other traffic.
+OOR_FETCH_CONCURRENCY = _oor_env_int("OOR_FETCH_CONCURRENCY", 3)
+OOR_WARM_CONCURRENCY = _oor_env_int("OOR_WARM_CONCURRENCY", 2)
+
+
+def _load_cached_reports_only(
+    names: Any,
+    sets: list[dict[str, Any]],
+    ctx_hash: str,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Cache-only report load: memory → SQLite → granular rebuild. Never hits start.gg.
+
+    Returns ``(reports, missing_names)``. Used by the comparison endpoint's
+    cache-only fast path so the UI can render whatever OOR context exists
+    immediately and stream only the missing players.
+    """
+    names = _dedupe_preserve_order(names)
+    reports: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+
+    cache_conn: sqlite3.Connection | None = None
+    try:
+        cache_conn = _oor_cache_conn()
+    except Exception:
+        cache_conn = None
+
+    def _accept_cached_report(p: str, refreshed: dict[str, Any]) -> bool:
+        if _in_region_placements_incomplete(refreshed, p, sets):
+            return False
+        reports[p] = refreshed
+        return True
+
+    for p in names:
+        mem = _mem_report_get(ctx_hash, p)
+        if mem is not None and not _oor_stats_empty(mem):
+            _oor_stat("report_mem_hits")
+            refreshed = _refresh_in_region_stats(mem, p, sets, cache_conn=cache_conn)
+            if _accept_cached_report(p, refreshed):
+                continue
+            missing.append(p)
+            continue
+        if cache_conn is None:
+            missing.append(p)
+            continue
+        try:
+            cached = _cache_get_report(cache_conn, ctx_hash, p)
+        except Exception:
+            cached = None
+        if cached is not None:
+            refreshed = _refresh_in_region_stats(cached, p, sets, cache_conn=cache_conn)
+            if not _oor_stats_empty(refreshed):
+                _oor_stat("report_sqlite_hits")
+                _mem_report_put(ctx_hash, p, refreshed)
+                if _accept_cached_report(p, refreshed):
+                    continue
+                missing.append(p)
+                continue
+        try:
+            state = _oor_fetch_state(cache_conn, ctx_hash, p)
+            row_count = _oor_event_row_count(cache_conn, ctx_hash, p)
+            if state == "complete" or row_count > 0:
+                # state == "complete" with zero OOR rows is a legitimate
+                # no-OOR-activity player, not a miss.
+                if row_count > 0 and _oor_event_rows_stale(cache_conn, ctx_hash, p):
+                    missing.append(p)
+                    continue
+                rebuilt = _oor_rebuild_report_from_rows(cache_conn, ctx_hash, p, sets)
+                if state == "complete" or not _oor_stats_empty(rebuilt):
+                    _oor_stat("report_rebuilds")
+                    refreshed = _refresh_in_region_stats(rebuilt, p, sets, cache_conn=cache_conn)
+                    if _in_region_placements_incomplete(refreshed, p, sets):
+                        missing.append(p)
+                        continue
+                    _cache_put_report(cache_conn, ctx_hash, p, refreshed)
+                    reports[p] = refreshed
+                    continue
+        except Exception:
+            pass
+        missing.append(p)
+
+    if cache_conn is not None:
+        try:
+            cache_conn.close()
+        except Exception:
+            pass
+    return reports, missing
+
+
 def _load_reports_for_players(
     names: Any,
     sets: list[dict[str, Any]],
@@ -1231,27 +2061,88 @@ def _load_reports_for_players(
         except Exception:
             cache_conn = None
 
+    _req_before = 0
+    try:
+        _req_before = get_request_count()
+    except Exception:
+        pass
+    _stats_before = _oor_stats_snapshot()
+
     need_live: list[str] = []
     for p in names:
+        if ctx_hash and force_refresh_oor:
+            # Full invalidation: drop the hot entry and skip every report-cache
+            # layer so the player is refetched live (set-history reads are also
+            # bypassed further down).
+            _mem_report_drop(ctx_hash, p)
+            need_live.append(p)
+            continue
+        elif ctx_hash:
+            # Fastest layer: in-process memory (hot during an active session).
+            mem = _mem_report_get(ctx_hash, p)
+            if mem is not None and not _oor_stats_empty(mem):
+                _oor_stat("report_mem_hits")
+                reports[p] = _refresh_in_region_stats(mem, p, sets, cache_conn=cache_conn)
+                if stream_event:
+                    stream_event({
+                        "type": "progress",
+                        "phase": "cache_hit_memory",
+                        "player": p,
+                        "message": "OOR report served from in-memory cache (no SQLite, no network)",
+                    })
+                continue
         if cache_conn and ctx_hash:
             cached = _cache_get_report(cache_conn, ctx_hash, p)
             if cached is not None:
-                reports[p] = cached
+                # In-region stats always come from the current processed set pool.
+                refreshed = _refresh_in_region_stats(cached, p, sets, cache_conn=cache_conn)
+                if _oor_stats_empty(refreshed):
+                    state = _oor_fetch_state(cache_conn, ctx_hash, p)
+                    row_count = _oor_event_row_count(cache_conn, ctx_hash, p)
+                    if row_count > 0 and _oor_event_rows_stale(cache_conn, ctx_hash, p):
+                        need_live.append(p)
+                        continue
+                    if state == "complete" or row_count > 0:
+                        try:
+                            rebuilt = _oor_rebuild_report_from_rows(cache_conn, ctx_hash, p, sets)
+                            reports[p] = _refresh_in_region_stats(rebuilt, p, sets, cache_conn=cache_conn)
+                            _oor_stat("report_rebuilds")
+                            _cache_put_report(cache_conn, ctx_hash, p, reports[p])
+                            if stream_event:
+                                stream_event({
+                                    "type": "progress",
+                                    "phase": "cache_hit_granular",
+                                    "player": p,
+                                    "message": "OOR report rebuilt from granular event rows (no live set fetch)",
+                                })
+                            continue
+                        except Exception:
+                            pass
+                    # Empty shell from a prior failed fetch — refetch OOR live.
+                    if _is_empty_report(cached):
+                        need_live.append(p)
+                        continue
+                    if _oor_stats_empty(refreshed):
+                        need_live.append(p)
+                        continue
+                reports[p] = refreshed
+                _oor_stat("report_sqlite_hits")
+                _mem_report_put(ctx_hash, p, refreshed)
                 if stream_event:
                     stream_event({
                         "type": "progress",
                         "phase": "cache_hit",
                         "player": p,
-                        "message": "OOR report loaded from SQLite cache (full report row)",
+                        "message": "OOR report loaded from SQLite cache (in-region stats refreshed from sets)",
                     })
                 continue
             state = _oor_fetch_state(cache_conn, ctx_hash, p)
             if state == "complete":
                 try:
                     rebuilt = _oor_rebuild_report_from_rows(cache_conn, ctx_hash, p, sets)
-                    reports[p] = rebuilt
-                    with _oor_cache_lock:
-                        _cache_put_report(cache_conn, ctx_hash, p, rebuilt)
+                    reports[p] = _refresh_in_region_stats(rebuilt, p, sets, cache_conn=cache_conn)
+                    _oor_stat("report_rebuilds")
+                    _cache_put_report(cache_conn, ctx_hash, p, reports[p])
                     if stream_event:
                         stream_event({
                             "type": "progress",
@@ -1291,6 +2182,9 @@ def _load_reports_for_players(
             )
 
     if not need_live:
+        for p in names:
+            if p in reports:
+                reports[p] = _refresh_in_region_stats(reports[p], p, sets, cache_conn=cache_conn)
         if cache_conn:
             cache_conn.close()
         return reports
@@ -1332,7 +2226,7 @@ def _load_reports_for_players(
                     oor_catalog = None
 
         if not stream_event:
-            _w = 1 if is_warm else 3
+            _w = OOR_WARM_CONCURRENCY if is_warm else OOR_FETCH_CONCURRENCY
             server_debug_log(
                 "info", "server/OOR",
                 "Start.gg identity map built; live OOR pipeline running",
@@ -1382,6 +2276,7 @@ def _load_reports_for_players(
             if cache_conn and not force_refresh_oor:
                 try:
                     cached_nodes, fetched_at = _oor_get_player_sets(cache_conn, pid, window_hash=oor_window_hash)
+                    _oor_stat("set_history_hits" if cached_nodes is not None else "set_history_misses")
                     if cached_nodes is not None:
                         preloaded_nodes = cached_nodes
                         age_min = round((int(_time.time()) - fetched_at) / 60, 1)
@@ -1419,21 +2314,41 @@ def _load_reports_for_players(
                         "message": _fr_msg,
                     })
 
-            # --- Tournament result cache closures (context-independent) ---
-            def _tourney_lookup(tournament_id: str) -> dict[str, Any] | None:
+            # --- Per-event result cache closures (context-independent) ---
+            def _tourney_lookup(event_slug: str) -> dict[str, Any] | None:
                 if not cache_conn:
                     return None
                 try:
-                    return _oor_get_tournament_result(cache_conn, pid, tournament_id)
+                    result = _oor_get_tournament_result(cache_conn, pid, event_slug)
                 except Exception:
                     return None
+                _oor_stat("tournament_result_hits" if result is not None else "tournament_result_misses")
+                return result
 
-            def _tourney_store(tournament_id: str, result: dict[str, Any]) -> None:
+            def _tourney_store(event_slug: str, result: dict[str, Any]) -> None:
                 if not cache_conn:
                     return
                 try:
-                    with _oor_cache_lock:
-                        _oor_put_tournament_result(cache_conn, pid, tournament_id, result)
+                    _oor_put_tournament_result(cache_conn, pid, event_slug, result)
+                except Exception:
+                    pass
+
+            # --- Event standings map closures (context-independent, shared by all players) ---
+            def _standings_lookup(event_id: str) -> dict[str, Any] | None:
+                if not cache_conn:
+                    return None
+                try:
+                    smap = _oor_get_event_standings(cache_conn, event_id)
+                except Exception:
+                    return None
+                _oor_stat("standings_hits" if smap is not None else "standings_misses")
+                return smap
+
+            def _standings_store(event_id: str, smap: dict[str, Any]) -> None:
+                if not cache_conn:
+                    return
+                try:
+                    _oor_put_event_standings(cache_conn, event_id, smap)
                 except Exception:
                     pass
 
@@ -1465,6 +2380,7 @@ def _load_reports_for_players(
                     })
 
             try:
+                _oor_stat("report_live_fetches")
                 report = _get_live_player_report(
                     client=client, config=cfg, canonical_name=player,
                     user_id=str(ident.get("user_id") or ""),
@@ -1479,6 +2395,8 @@ def _load_reports_for_players(
                     tournament_cache_lookup=_tourney_lookup,
                     tournament_cache_store=_tourney_store,
                     oor_catalog_tournament_ids=oor_catalog if preloaded_nodes is None else None,
+                    standings_lookup=_standings_lookup,
+                    standings_store=_standings_store,
                 )
             except CancelledOOR:
                 if stream_event:
@@ -1519,16 +2437,18 @@ def _load_reports_for_players(
                 try:
                     with _oor_cache_lock:
                         for pl in report.get("out_region_placements", []):
+                            # Full row (incl. notable lists / start_at / event_id) so the
+                            # granular rebuild path reproduces the complete report.
                             ev_data = {
                                 "tournament_id": pl.get("tournament_id", ""),
                                 "event_slug": pl.get("event_slug", ""),
-                                "event_id": "",
+                                "event_id": pl.get("event_id", ""),
                                 "tournament_name": pl.get("tournament_name", ""),
-                                "start_at": 0,
+                                "start_at": pl.get("start_at", 0),
                                 "wins": pl.get("wins", 0),
                                 "losses": pl.get("losses", 0),
-                                "notable_wins": [],
-                                "notable_losses": [],
+                                "notable_wins": pl.get("notable_wins", []),
+                                "notable_losses": pl.get("notable_losses", []),
                                 "placement": pl.get("placement"),
                             }
                             _oor_upsert_event_row(cache_conn, ctx_hash, player, ev_data)
@@ -1541,12 +2461,13 @@ def _load_reports_for_players(
             return player, report
 
         def _apply_fetch_result(player: str, report: dict[str, Any]) -> None:
+            report = _refresh_in_region_stats(report, player, sets, cache_conn=cache_conn)
             reports[player] = report
             try:
                 _upsert_live_player_report(pdb, report, elo.get(player, cfg.initial_elo))
             except Exception:
                 pass
-            if cache_conn and ctx_hash:
+            if cache_conn and ctx_hash and not _is_empty_report(report):
                 try:
                     with _oor_cache_lock:
                         _cache_put_report(cache_conn, ctx_hash, player, report)
@@ -1568,7 +2489,7 @@ def _load_reports_for_players(
                 _apply_fetch_result(player, report)
         else:
             # Warm jobs use fewer workers to avoid starving pair fetches.
-            workers = 1 if is_warm else 3
+            workers = OOR_WARM_CONCURRENCY if is_warm else OOR_FETCH_CONCURRENCY
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(_fetch_one, p): p for p in need_live}
                 for fut in concurrent.futures.as_completed(futures):
@@ -1585,11 +2506,35 @@ def _load_reports_for_players(
         for p in names:
             if p not in reports:
                 reports[p] = _empty_report(p)
+
+    for p in names:
+        if p in reports:
+            reports[p] = _refresh_in_region_stats(reports[p], p, sets, cache_conn=cache_conn)
+
     if cache_conn:
         try:
             cache_conn.close()
         except Exception:
             pass
+
+    # Per-batch observability: cache layer hits + start.gg requests attributable
+    # to this load (rate-gate counter diff; approximate under concurrent jobs).
+    try:
+        _req_used = max(0, get_request_count() - _req_before)
+        _stats_after = _oor_stats_snapshot()
+        _d = {k: _stats_after.get(k, 0) - _stats_before.get(k, 0) for k in _stats_after}
+        tag = "[warm] " if is_warm else ""
+        server_debug_log(
+            "info", "server/OOR",
+            f"{tag}Report batch done: {len(names)} player(s), ~{_req_used} start.gg request(s)",
+            f"mem={_d.get('report_mem_hits', 0)} sqlite={_d.get('report_sqlite_hits', 0)} "
+            f"rebuilt={_d.get('report_rebuilds', 0)} live={_d.get('report_live_fetches', 0)} · "
+            f"sets {_d.get('set_history_hits', 0)}H/{_d.get('set_history_misses', 0)}M · "
+            f"standings {_d.get('standings_hits', 0)}H/{_d.get('standings_misses', 0)}M · "
+            f"tourney {_d.get('tournament_result_hits', 0)}H/{_d.get('tournament_result_misses', 0)}M",
+        )
+    except Exception:
+        pass
     return reports
 
 
@@ -1612,13 +2557,19 @@ def _oor_warm_worker(
     merge_rules: list[dict[str, str]],
     names: list[str],
 ) -> None:
-    """Background job: preload live OOR reports for all given players into the cache."""
+    """Background job: preload live OOR reports for all given players into the cache.
+
+    Resumable by construction — players already cached are skipped on the cache
+    pass, so re-firing the job after an interruption only fetches the remainder.
+    Names are warmed highest-ELO first so the most comparison-relevant players
+    are ready soonest.
+    """
     total = len(names)
     try:
         server_debug_log(
             "info", "server/OOR-warm",
             "Worker started",
-            f"job={job_id[:8]}… · {total} player(s)",
+            f"job={job_id[:8]}… · {total} player(s) · workers={OOR_WARM_CONCURRENCY}",
         )
         _ensure_runtime_deps()
         sets, elo = _pr_maker_merged_sets_and_elo(start, end, event_slugs, merge_rules)
@@ -1628,11 +2579,26 @@ def _oor_warm_worker(
         )
         ch = _pr_maker_context_hash(start, end, event_slugs, merge_rules)
 
+        # Highest in-region ELO first: top candidates appear in pairwise
+        # comparisons most often, so their OOR data is the most valuable to have
+        # warm early. (Active pair names still jump this queue inside the loader.)
+        names = sorted(names, key=lambda n: elo.get(n, cfg.initial_elo), reverse=True)
+
+        _req_before = 0
+        try:
+            _req_before = get_request_count()
+        except Exception:
+            pass
+
         def _progress(completed: int, t: int, current_name: str) -> None:
             with JOB_LOCK:
                 OOR_WARM_JOBS[job_id]["completed"] = completed
                 OOR_WARM_JOBS[job_id]["total"] = t
                 OOR_WARM_JOBS[job_id]["currentPlayer"] = current_name
+                try:
+                    OOR_WARM_JOBS[job_id]["requestsUsed"] = max(0, get_request_count() - _req_before)
+                except Exception:
+                    pass
             detail = f"{completed}/{t}"
             if current_name:
                 detail += f" · last: {current_name}"
@@ -1641,12 +2607,17 @@ def _oor_warm_worker(
         wh = _oor_window_hash(start, end)
         _load_reports_for_players(names, sets, elo, cfg, ctx_hash=ch, oor_window_hash=wh, progress_cb=_progress, is_warm=True)
 
+        _req_used = 0
+        try:
+            _req_used = max(0, get_request_count() - _req_before)
+        except Exception:
+            pass
         with JOB_LOCK:
-            OOR_WARM_JOBS[job_id].update(status="done", completed=total)
+            OOR_WARM_JOBS[job_id].update(status="done", completed=total, requestsUsed=_req_used)
         server_debug_log(
             "info", "server/OOR-warm",
             "Worker finished",
-            f"job={job_id[:8]}… · {total} player(s) cached",
+            f"job={job_id[:8]}… · {total} player(s) cached · ~{_req_used} start.gg request(s)",
         )
     except Exception as exc:
         with JOB_LOCK:
@@ -1655,12 +2626,14 @@ def _oor_warm_worker(
 
 
 def _pr_maker_scrape_worker(job_id: str, *, start: str, end: str, fresh: bool) -> None:
-    """Stage-1 only: list ELO-eligible events in the date range; [CACHED] vs [NOT CACHED].
+    """Stage-1 only: list ELO-eligible events in the date range; [CACHED] vs [NEW].
 
-    Same filter as ``tournament_scraper.scrape_tournaments`` / ``full.py`` pipeline:
-    ``game_filter`` (Ultimate) and ``min_entrants`` (16 by default). NorCal regions
-    come from ``ScraperConfig`` (bay + sacramento) via ``_fetch_all_tournaments``.
+    Delegates the network work to ``scrape_tournaments`` so the PR Maker scrape
+    gets the same incremental week-coverage skipping + concurrent async engine as
+    the homepage/date-range jobs (the previous version walked the full range
+    sequentially with the sync client on every run).
     """
+    _warm_pause_begin()
     try:
         _ensure_runtime_deps()
 
@@ -1668,7 +2641,7 @@ def _pr_maker_scrape_worker(job_id: str, *, start: str, end: str, fresh: bool) -
 
         cache_path = _ts_mod._default_cache_path()
         _ts_mod._ensure_cache_dir(cache_path)
-        conn = sqlite3.connect(str(cache_path))
+        conn = _ts_mod.connect_db(cache_path)
         _ts_mod._init_cache(conn)
 
         after = _ts_mod._date_to_unix(start)
@@ -1699,6 +2672,7 @@ def _pr_maker_scrape_worker(job_id: str, *, start: str, end: str, fresh: bool) -
             )
             with JOB_LOCK:
                 PR_MAKER_SCRAPE_JOBS[job_id]["log"] = list(log_lines)
+        conn.close()
 
         with JOB_LOCK:
             PR_MAKER_SCRAPE_JOBS[job_id]["phase"] = "fetching"
@@ -1707,87 +2681,65 @@ def _pr_maker_scrape_worker(job_id: str, *, start: str, end: str, fresh: bool) -
         if not token:
             raise ValueError("STARTGG_API_KEY required in environment or .env")
 
-        client = _ts_mod.requests.Session()
-        limiter = _ts_mod.RateLimiter()
-
-        config = ScraperConfig(
-            start_date=start,
-            end_date=end,
-            game_filter=GAME_FILTER,
-            min_entrants=min_entrants,
-            regions=["bay", "sacramento"],
+        job_started = int(_time.time())
+        req_before = get_request_count()
+        _, scrape_stats = scrape_tournaments(
+            ScraperConfig(
+                start_date=start,
+                end_date=end,
+                game_filter=GAME_FILTER,
+                min_entrants=min_entrants,
+                regions=["bay", "sacramento"],
+                incremental=not fresh,
+                force_refresh=fresh,
+            ),
+            verbose=False,
         )
-
-        to_insert: list[tuple] = []
-        cached_count = 0
-        new_count = 0
-        seen_tournament_ids: set[str] = set()
-
-        for t in _ts_mod._fetch_all_tournaments(client, limiter, config, token, verbose=False):
-            tid = str(t.get("id", ""))
-            if not tid or tid in seen_tournament_ids:
-                continue
-            seen_tournament_ids.add(tid)
-
-            pairs = _ts_mod._flatten_and_filter([t], GAME_FILTER, min_entrants)
-            if not pairs:
-                continue
-
-            t_name = str(t.get("name") or "?")
-            for pair in pairs:
-                ev = pair.get("event") or {}
-                ev_name = str(ev.get("name") or "Event")
-                slug = str(ev.get("slug") or "")
-                label = f"{t_name} — {ev_name}"
-
-                if _pr_maker_event_row_cached(
-                    conn,
-                    tournament_id=tid,
-                    event_slug=slug,
-                    game_filter=GAME_FILTER,
-                    min_entrants=min_entrants,
-                    after=after,
-                    before=before,
-                ):
-                    cached_count += 1
-                    log_lines.append(f"[CACHED] {label}")
-                else:
-                    new_count += 1
-                    log_lines.append(f"[NOT CACHED] {label}")
-                    row = _ts_mod._tournament_to_row(t, ev)
-                    to_insert.append(row)
-
-            with JOB_LOCK:
-                PR_MAKER_SCRAPE_JOBS[job_id]["log"] = list(log_lines)
-                PR_MAKER_SCRAPE_JOBS[job_id]["tournamentsCached"] = cached_count
-                PR_MAKER_SCRAPE_JOBS[job_id]["tournamentsNew"] = new_count
-                PR_MAKER_SCRAPE_JOBS[job_id]["tournamentsTotal"] = cached_count + new_count
+        requests_used = get_request_count() - req_before
 
         with JOB_LOCK:
             PR_MAKER_SCRAPE_JOBS[job_id]["phase"] = "saving"
 
-        if to_insert:
-            conn.executemany(
-                "INSERT OR REPLACE INTO tournaments "
-                "(tournament_id, event_slug, name, city, slug, start_at, event_num_entrants, videogame_name, raw_json, cached_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                to_insert,
-            )
-            conn.commit()
-            log_lines.append(f"[DB] Inserted {len(to_insert)} new row(s) (ELO-eligible events only).")
-        else:
-            log_lines.append("[DB] No new rows to insert (all qualifying events already cached).")
-
-        _ts_mod.record_verified_empty_weeks_for_scrape_window(
-            conn,
-            range_start=start,
-            range_end=end,
-            game_filter=GAME_FILTER,
-        )
-        conn.commit()
+        # Label every ELO-eligible event in the window from the cache. Rows
+        # (re)written by this job carry a fresh cached_at; everything else was
+        # already cached (possibly from a skipped, fully-covered week).
+        conn = _ts_mod.connect_db(cache_path)
+        rows = conn.execute(
+            """
+            SELECT name, raw_json, cached_at FROM tournaments
+            WHERE start_at >= ? AND start_at <= ?
+              AND videogame_name = ? AND event_num_entrants >= ?
+            ORDER BY start_at
+            """,
+            (after, before, GAME_FILTER, min_entrants),
+        ).fetchall()
         conn.close()
 
+        cached_count = 0
+        new_count = 0
+        for t_name, raw_json, cached_at in rows:
+            ev_name = "Event"
+            try:
+                ev_name = str(((json.loads(raw_json) if raw_json else {}).get("event") or {}).get("name") or "Event")
+            except (json.JSONDecodeError, TypeError):
+                pass
+            label = f"{t_name or '?'} — {ev_name}"
+            if cached_at is not None and int(cached_at) >= job_started:
+                new_count += 1
+                log_lines.append(f"[NOT CACHED] {label}")
+            else:
+                cached_count += 1
+                log_lines.append(f"[CACHED] {label}")
+
         total = cached_count + new_count
+        log_lines.append(
+            f"[API] {requests_used} start.gg request(s) this scrape "
+            f"(incremental skipped already-covered weeks)" if not fresh else
+            f"[API] {requests_used} start.gg request(s) this scrape (fresh re-fetch)",
+        )
+        log_lines.append(
+            f"[CACHE] Tournament-level: {scrape_stats.hits} unchanged, {scrape_stats.misses} new/updated.",
+        )
         log_lines.append(
             f"[DONE] {cached_count} cached, {new_count} new — {total} ELO-eligible event(s) "
             f"({GAME_FILTER}, >={min_entrants} entrants).",
@@ -1797,11 +2749,17 @@ def _pr_maker_scrape_worker(job_id: str, *, start: str, end: str, fresh: bool) -
             PR_MAKER_SCRAPE_JOBS[job_id]["status"] = "done"
             PR_MAKER_SCRAPE_JOBS[job_id]["phase"] = "done"
             PR_MAKER_SCRAPE_JOBS[job_id]["log"] = list(log_lines)
+            PR_MAKER_SCRAPE_JOBS[job_id]["tournamentsCached"] = cached_count
+            PR_MAKER_SCRAPE_JOBS[job_id]["tournamentsNew"] = new_count
+            PR_MAKER_SCRAPE_JOBS[job_id]["tournamentsTotal"] = total
+            PR_MAKER_SCRAPE_JOBS[job_id]["requestsUsed"] = requests_used
     except Exception as exc:
         with JOB_LOCK:
             PR_MAKER_SCRAPE_JOBS[job_id]["status"] = "error"
             PR_MAKER_SCRAPE_JOBS[job_id]["error"] = str(exc)
             PR_MAKER_SCRAPE_JOBS[job_id]["phase"] = "error"
+    finally:
+        _warm_pause_end()
 
 
 def _list_cached_events_for_range(start_iso: str, end_iso: str) -> list[dict[str, Any]]:
@@ -1819,6 +2777,8 @@ def _list_cached_events_for_range(start_iso: str, end_iso: str) -> list[dict[str
     if after is None or before is None:
         conn.close()
         return []
+    _ts_mod._ensure_ineligible_events_table(conn)
+    ineligible_slugs = _ts_mod.get_ineligible_event_slugs(conn)
     rows = conn.execute(
         """
         SELECT tournament_id, event_slug, name, slug, start_at,
@@ -1864,149 +2824,71 @@ def _list_cached_events_for_range(start_iso: str, end_iso: str) -> list[dict[str
             "entrantCount": row[5] or 0,
             "eventLink": f"https://start.gg/{event_slug.lstrip('/')}" if event_slug else "",
             "isProcessed": event_slug in processed_slugs,
+            "isIneligible": event_slug in ineligible_slugs,
         })
     return events
 
 
+def _set_cached_event_ineligible(event_slug: str, ineligible: bool) -> dict[str, Any]:
+    """Persist or clear the manual ineligible flag for a cached event."""
+    _ensure_runtime_deps()
+    slug = str(event_slug or "").strip()
+    if not slug:
+        raise ValueError("eventSlug is required")
+    cache_path = _ts_mod._default_cache_path()
+    if not cache_path.exists():
+        raise ValueError("Tournament cache not found")
+    conn = sqlite3.connect(str(cache_path))
+    try:
+        _ts_mod._ensure_ineligible_events_table(conn)
+        row = conn.execute(
+            "SELECT 1 FROM tournaments WHERE event_slug = ? LIMIT 1",
+            (slug,),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Event not found in cache: {slug}")
+        _ts_mod.set_event_ineligible(conn, slug, ineligible)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"eventSlug": slug, "ineligible": bool(ineligible)}
+
+
 def _pr_maker_process_worker(job_id: str, *, event_slugs: list[str]) -> None:
-    """Process selected events: fetch sets per event and populate processed_tournament.db."""
+    """Process selected events: fetch sets per event and populate processed_tournament.db.
+
+    Delegates to the shared :func:`tournament_processor._run_processing` core
+    (folded sets+players query, concurrent engine, batched writes) scoped to the
+    user's selected event slugs. The previous version issued one request per set
+    (~``1 + ceil(sets/40) + sets`` requests/event vs ~``ceil(sets/40)`` now).
+    """
+    _warm_pause_begin()
     try:
         _ensure_runtime_deps()
         token = os.environ.get("STARTGG_API_KEY", "").strip()
         if not token:
             raise ValueError("STARTGG_API_KEY required in environment or .env")
 
-        proc_path = PROJECT_ROOT / "data" / "processed_tournament.db"
-        proc_path.parent.mkdir(parents=True, exist_ok=True)
-        pconn = sqlite3.connect(str(proc_path))
-        tp._init_processed_db(pconn)
-
-        processed_event_slugs = {
-            r[0] for r in pconn.execute("SELECT event_slug FROM processed_events").fetchall()
-        }
-        sets_cache: dict[str, dict[str, Any]] = {
-            row[0]: {"p1_name": row[1], "p2_name": row[2], "p1_score": row[3], "p2_score": row[4]}
-            for row in pconn.execute(
-                "SELECT set_id, p1_name, p2_name, p1_score, p2_score FROM sets_cache"
-            ).fetchall()
-        }
-
-        cache_path = _ts_mod._default_cache_path()
-        tconn = sqlite3.connect(str(cache_path))
-
         total = len(event_slugs)
-        client = tp.requests.Session()
-        limiter = tp.RateLimiter()
-        all_sets: list[dict[str, Any]] = []
+        req_before = get_request_count()
 
-        for i, event_slug in enumerate(event_slugs):
-            row = tconn.execute(
-                "SELECT name, tournament_id FROM tournaments WHERE event_slug = ? LIMIT 1",
-                (event_slug,),
-            ).fetchone()
-            event_display = row[0] if row else event_slug
-            tournament_id = row[1] if row else ""
-
-            pct = round((i / total) * 100, 2) if total else 0
+        def _on_progress(done: int, t: int) -> None:
+            pct = round((done / t) * 100, 2) if t else 100.0
             with JOB_LOCK:
                 PR_MAKER_PROCESS_JOBS[job_id].update({
-                    "currentEvent": i + 1,
-                    "totalEvents": total,
-                    "currentEventName": event_display,
+                    "currentEvent": min(done, t),
+                    "totalEvents": t,
                     "progressPct": pct,
                     "phase": "processing",
                 })
 
-            if event_slug in processed_event_slugs:
-                cur = pconn.execute(
-                    "SELECT set_id, p1_name, p2_name, p1_score, p2_score FROM sets_cache WHERE event_slug = ?",
-                    (event_slug,),
-                )
-                for srow in cur.fetchall():
-                    if srow[3] is not None and srow[4] is not None:
-                        all_sets.append({srow[1]: srow[3], srow[2]: srow[4]})
-                continue
-
-            try:
-                event_id = tp._get_event_id(client, limiter, event_slug, token)
-            except Exception:
-                continue
-            if not event_id:
-                continue
-
-            try:
-                set_ids = tp._get_set_ids_for_event(client, limiter, event_id, token)
-            except Exception:
-                continue
-
-            with JOB_LOCK:
-                PR_MAKER_PROCESS_JOBS[job_id]["currentEventSets"] = len(set_ids)
-                PR_MAKER_PROCESS_JOBS[job_id]["currentEventSetsProcessed"] = 0
-
-            event_sets_to_insert: list[tuple[Any, ...]] = []
-            sets_done = 0
-            for set_id in set_ids:
-                if set_id in sets_cache:
-                    rec = sets_cache[set_id]
-                    all_sets.append({rec["p1_name"]: rec["p1_score"], rec["p2_name"]: rec["p2_score"]})
-                elif set_id.startswith("preview_"):
-                    pass
-                else:
-                    try:
-                        result = tp._get_players_and_score(client, limiter, set_id, token)
-                    except Exception:
-                        continue
-                    if result and len(result) == 2:
-                        s1, s2 = list(result.values())
-                        if s1 is not None and s2 is not None:
-                            all_sets.append(result)
-                            p1, p2 = list(result.keys())
-                            event_sets_to_insert.append(
-                                (set_id, event_id, event_slug, p1, p2, s1, s2, int(_time.time()))
-                            )
-                sets_done += 1
-                if sets_done % 5 == 0 or sets_done == len(set_ids):
-                    with JOB_LOCK:
-                        PR_MAKER_PROCESS_JOBS[job_id]["currentEventSetsProcessed"] = sets_done
-
-            if set_ids:
-                pconn.execute(
-                    "INSERT OR REPLACE INTO processed_events "
-                    "(event_slug, event_id, tournament_id, event_name, processed_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (event_slug, event_id, tournament_id, event_display, int(_time.time())),
-                )
-                if event_sets_to_insert:
-                    pconn.executemany(
-                        "INSERT OR REPLACE INTO sets_cache "
-                        "(set_id, event_id, event_slug, p1_name, p2_name, p1_score, p2_score, cached_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        event_sets_to_insert,
-                    )
-                pconn.commit()
-                processed_event_slugs.add(event_slug)
-                for rec in event_sets_to_insert:
-                    sets_cache[rec[0]] = {
-                        "p1_name": rec[3], "p2_name": rec[4],
-                        "p1_score": rec[5], "p2_score": rec[6],
-                    }
-
-        tconn.close()
-
-        mapped_sets = tp._apply_name_mappings(all_sets, tp.DEFAULT_NAME_MAPPINGS)
-        pconn.execute("DELETE FROM processed_sets")
-        for idx, s in enumerate(mapped_sets):
-            names = list(s.keys())
-            scores = list(s.values())
-            if len(names) == 2 and len(scores) == 2:
-                pconn.execute(
-                    "INSERT INTO processed_sets "
-                    "(set_id, event_slug, p1_canonical, p2_canonical, p1_score, p2_score, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (f"proc_{idx}", "", names[0], names[1], scores[0], scores[1], int(_time.time())),
-                )
-        pconn.commit()
-        pconn.close()
+        result = tp._run_processing(
+            ProcessorConfig(include_event_slugs=list(event_slugs)),
+            token,
+            verbose=False,
+            progress_cb=_on_progress,
+        )
+        requests_used = get_request_count() - req_before
 
         with JOB_LOCK:
             PR_MAKER_PROCESS_JOBS[job_id].update({
@@ -2014,13 +2896,25 @@ def _pr_maker_process_worker(job_id: str, *, event_slugs: list[str]) -> None:
                 "phase": "done",
                 "progressPct": 100.0,
                 "currentEvent": total,
-                "totalSetsProcessed": len(mapped_sets),
+                "totalEvents": total,
+                "totalSetsProcessed": len(result.mapped_sets),
+                "eventCacheHits": result.stats.event_hits,
+                "eventCacheMisses": result.stats.event_misses,
+                "requestsUsed": requests_used,
             })
+        server_debug_log(
+            "info", "server/PR-process",
+            f"Processed {total} event(s): {result.stats.event_hits} cache hits, "
+            f"{result.stats.event_misses} fetched",
+            f"{requests_used} start.gg request(s), {len(result.mapped_sets)} sets",
+        )
     except Exception as exc:
         with JOB_LOCK:
             PR_MAKER_PROCESS_JOBS[job_id]["status"] = "error"
             PR_MAKER_PROCESS_JOBS[job_id]["error"] = str(exc)
             PR_MAKER_PROCESS_JOBS[job_id]["phase"] = "error"
+    finally:
+        _warm_pause_end()
 
 
 def _progressive_recent_events_worker(job_id: str, *, days: int, limit: int, sample_registrants: int) -> None:
@@ -2146,107 +3040,26 @@ def _process_tournaments_with_progress(
     *,
     progress_cb: callable | None,
 ) -> tuple[list[dict[str, Any]], int]:
+    """
+    Run stage-2 processing with a progress callback.
+
+    Delegates to the shared :func:`tournament_processor._run_processing` core,
+    which fetches sets for cache-miss events using the folded query (players +
+    scores inline) via the concurrent engine — sharing the one process-wide rate
+    budget with background warming. This replaces the previous per-set N+1 loop.
+    """
     token = os.environ.get("STARTGG_API_KEY")
     if not token:
         raise ValueError("STARTGG_API_KEY must be set in environment or .env")
     if not config.tournament_cache_path.exists():
         raise FileNotFoundError(f"Tournament cache not found: {config.tournament_cache_path}")
 
-    tconn = sqlite3.connect(str(config.tournament_cache_path))
-    events_to_process = tp._load_events_from_tournament_cache(tconn, config)
-    tconn.close()
-
-    total_events = len(events_to_process)
-    if progress_cb is not None:
-        progress_cb(0, total_events)
-
-    pconn = sqlite3.connect(str(config.processed_cache_path))
-    tp._init_processed_db(pconn)
-    processed_event_slugs = {row[0] for row in pconn.execute("SELECT event_slug FROM processed_events").fetchall()}
-    sets_cache = {
-        row[0]: {"p1_name": row[1], "p2_name": row[2], "p1_score": row[3], "p2_score": row[4]}
-        for row in pconn.execute("SELECT set_id, p1_name, p2_name, p1_score, p2_score FROM sets_cache").fetchall()
-    }
-
-    client = tp.requests.Session()
-    limiter = tp.RateLimiter()
-    all_sets: list[dict[str, Any]] = []
-    done = 0
-
-    for event_slug, tournament_id, event_name in events_to_process:
-        if event_slug in processed_event_slugs:
-            cur = pconn.execute(
-                "SELECT set_id, p1_name, p2_name, p1_score, p2_score FROM sets_cache WHERE event_slug = ?",
-                (event_slug,),
-            )
-            for row in cur.fetchall():
-                p1_score, p2_score = row[3], row[4]
-                if p1_score is not None and p2_score is not None:
-                    all_sets.append({row[1]: p1_score, row[2]: p2_score})
-            done += 1
-            if progress_cb is not None:
-                progress_cb(done, total_events)
-            continue
-
-        event_id = tp._get_event_id(client, limiter, event_slug, token)
-        if not event_id:
-            done += 1
-            if progress_cb is not None:
-                progress_cb(done, total_events)
-            continue
-
-        set_ids = tp._get_set_ids_for_event(client, limiter, event_id, token)
-        event_sets_to_insert: list[tuple[Any, ...]] = []
-        for set_id in set_ids:
-            if set_id in sets_cache:
-                rec = sets_cache[set_id]
-                all_sets.append({rec["p1_name"]: rec["p1_score"], rec["p2_name"]: rec["p2_score"]})
-                continue
-            if set_id.startswith("preview_"):
-                continue
-            result = tp._get_players_and_score(client, limiter, set_id, token)
-            if result and len(result) == 2:
-                s1, s2 = list(result.values())
-                if s1 is not None and s2 is not None:
-                    all_sets.append(result)
-                    p1, p2 = list(result.keys())
-                    event_sets_to_insert.append((set_id, event_id, event_slug, p1, p2, s1, s2, int(tp.time.time())))
-
-        if set_ids:
-            pconn.execute(
-                "INSERT OR REPLACE INTO processed_events (event_slug, event_id, tournament_id, event_name, processed_at) VALUES (?, ?, ?, ?, ?)",
-                (event_slug, event_id, tournament_id, event_name, int(tp.time.time())),
-            )
-            if event_sets_to_insert:
-                pconn.executemany(
-                    "INSERT OR REPLACE INTO sets_cache (set_id, event_id, event_slug, p1_name, p2_name, p1_score, p2_score, cached_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    event_sets_to_insert,
-                )
-            pconn.commit()
-            processed_event_slugs.add(event_slug)
-            for rec in event_sets_to_insert:
-                sets_cache[rec[0]] = {"p1_name": rec[3], "p2_name": rec[4], "p1_score": rec[5], "p2_score": rec[6]}
-
-        done += 1
-        if progress_cb is not None:
-            progress_cb(done, total_events)
-
-    mapped_sets = tp._apply_name_mappings(all_sets, config.name_mappings)
-    pconn.execute("DELETE FROM processed_sets")
-    for i, s in enumerate(mapped_sets):
-        names = list(s.keys())
-        scores = list(s.values())
-        if len(names) == 2 and len(scores) == 2:
-            pconn.execute(
-                "INSERT INTO processed_sets (set_id, event_slug, p1_canonical, p2_canonical, p1_score, p2_score, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (f"proc_{i}", "", names[0], names[1], scores[0], scores[1], int(tp.time.time())),
-            )
-    pconn.commit()
-    pconn.close()
-    return mapped_sets, total_events
+    result = tp._run_processing(config, token, verbose=False, progress_cb=progress_cb)
+    return result.mapped_sets, result.total_events
 
 
-def _date_range_worker(job_id: str, *, start: str, end: str) -> None:
+def _date_range_worker(job_id: str, *, start: str, end: str, force_refresh: bool = False) -> None:
+    _warm_pause_begin()
     try:
         _ensure_runtime_deps()
         start_d = _parse_iso_date(start)
@@ -2264,6 +3077,8 @@ def _date_range_worker(job_id: str, *, start: str, end: str) -> None:
                 game_filter=GAME_FILTER,
                 min_entrants=16,
                 regions=["bay", "sacramento"],
+                incremental=not force_refresh,
+                force_refresh=force_refresh,
             ),
             verbose=False,
         )
@@ -2291,7 +3106,10 @@ def _date_range_worker(job_id: str, *, start: str, end: str) -> None:
         with JOB_LOCK:
             DATE_RANGE_JOBS[job_id]["phase"] = "computing"
 
-        elo, _ = compute_elo(EloConfig(start_date=_date_to_str(start_d), end_date=_date_to_str(end_d)))
+        elo = _memoized(
+            ("elo-range", _date_to_str(start_d), _date_to_str(end_d)),
+            lambda: compute_elo(EloConfig(start_date=_date_to_str(start_d), end_date=_date_to_str(end_d)))[0],
+        )
         rows, total_players = _filter_and_rank(elo, query="", max_players=5000)
         payload = {
             "mode": "date-range",
@@ -2311,6 +3129,8 @@ def _date_range_worker(job_id: str, *, start: str, end: str) -> None:
         with JOB_LOCK:
             DATE_RANGE_JOBS[job_id]["status"] = "error"
             DATE_RANGE_JOBS[job_id]["error"] = str(exc)
+    finally:
+        _warm_pause_end()
 
 
 def _sanitize_for_json(obj: Any) -> Any:
@@ -2328,6 +3148,9 @@ def _sanitize_for_json(obj: Any) -> Any:
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = "NorCalSmashAPI/0.1"
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        """Silence per-request stderr logging (UI polls several endpoints every ~1s)."""
 
     def _write_json(self, status: int, payload: dict[str, Any]) -> None:
         """Write JSON; ignore client disconnect (BrokenPipe) so the server thread does not crash."""
@@ -2409,9 +3232,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "error": None,
                     }
                 payload_list = list(ranges_in) if isinstance(ranges_in, list) else []
+                force_refresh = bool(body.get("forceRefresh") or False)
                 Thread(
                     target=_coverage_resolve_worker,
                     args=(job_id, payload_list),
+                    kwargs={"force_refresh": force_refresh},
                     daemon=True,
                 ).start()
                 self._write_json(200, {"jobId": job_id})
@@ -2622,7 +3447,34 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ch = _pr_maker_context_hash(start_iso, end_iso, event_slugs, merge_rules)
                 wh = _oor_window_hash(start_iso, end_iso)
                 force_oor = bool(body.get("forceRefreshOOR", False))
-                if include_oor:
+                oor_cache_only = bool(body.get("oorCacheOnly", False))
+                missing_oor: list[str] = []
+                if include_oor and oor_cache_only and not force_oor:
+                    # Fast path: serve whatever OOR is already cached (memory →
+                    # SQLite → granular rebuild) without touching start.gg. The
+                    # client streams only the missing players, so a warm cache
+                    # makes a comparison a single round trip.
+                    reports, missing_oor = _load_cached_reports_only(
+                        [player_a, player_b], sets, ch,
+                    )
+                    _cmp_cache: sqlite3.Connection | None = None
+                    try:
+                        _cmp_cache = _oor_cache_conn()
+                    except Exception:
+                        _cmp_cache = None
+                    try:
+                        for nm in (player_a, player_b):
+                            if nm not in reports:
+                                reports[nm] = _refresh_in_region_stats(
+                                    _empty_report(nm), nm, sets, cache_conn=_cmp_cache,
+                                )
+                    finally:
+                        if _cmp_cache is not None:
+                            try:
+                                _cmp_cache.close()
+                            except Exception:
+                                pass
+                elif include_oor:
                     reports = _load_reports_for_pair(
                         player_a, player_b, sets, elo, cfg,
                         ctx_hash=ch, oor_window_hash=wh, force_refresh_oor=force_oor,
@@ -2639,7 +3491,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 expanded = _expanded_head_to_head(
                     player_a, player_b, sets, reports, elo=elo,
                 )
-                self._write_json(200, {"card": card, "expanded": expanded, "hasOOR": bool(include_oor)})
+                self._write_json(200, {
+                    "card": card,
+                    "expanded": expanded,
+                    "hasOOR": bool(include_oor) and not missing_oor,
+                    "missingOOR": missing_oor,
+                })
                 return
 
             if parsed.path == "/api/pr-maker/comparison/argument":
@@ -2659,15 +3516,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                 player_b = str(body.get("playerB", ""))
                 if not event_slugs or not player_a or not player_b:
                     self._write_json(400, {"error": "eventSlugs, playerA, playerB required"})
-                    return
-                try:
-                    from openai import OpenAI as _OAI  # type: ignore
-                except Exception:
-                    self._write_json(503, {"error": "openai package not installed"})
-                    return
-                api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-                if not api_key:
-                    self._write_json(503, {"error": "OPENAI_API_KEY not set"})
                     return
                 sets, elo = _pr_maker_merged_sets_and_elo(start_iso, end_iso, event_slugs, merge_rules)
                 cfg = EloConfig(
@@ -2692,17 +3540,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 prompt = _build_ai_justification_prompt(card)
                 try:
-                    client = _OAI(api_key=api_key)
-                    resp = client.chat.completions.create(
-                        model=str(body.get("model", "gpt-4o-mini")),
-                        messages=[
+                    text = complete_chat(
+                        [
                             {"role": "system", "content": "You are a careful esports ranking analyst."},
                             {"role": "user", "content": prompt},
                         ],
+                        model=str(body.get("model", "")).strip() or None,
+                        enable_thinking=False,
                     )
-                    text = (resp.choices[0].message.content or "").strip()
-                except Exception as oai_exc:
-                    self._write_json(502, {"error": f"OpenAI call failed: {oai_exc}"})
+                except Exception as llm_exc:
+                    reason = llm_unavailable_reason()
+                    self._write_json(502, {"error": f"LLM call failed: {llm_exc}. {reason}"})
                     return
                 self._write_json(200, {"text": text})
                 return
@@ -2857,6 +3705,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._write_json(200, {"jobId": job_id})
                 return
 
+            if parsed.path == "/api/pr-maker/events/ineligible":
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except json.JSONDecodeError as jexc:
+                    self._write_json(400, {"error": f"Invalid JSON: {jexc}"})
+                    return
+                event_slug = str(body.get("eventSlug", "") or "").strip()
+                if not event_slug:
+                    self._write_json(400, {"error": "eventSlug is required"})
+                    return
+                ineligible = bool(body.get("ineligible", False))
+                result = _set_cached_event_ineligible(event_slug, ineligible)
+                self._write_json(200, result)
+                return
+
             self._write_json(404, {"error": f"Unknown path: {parsed.path}"})
         except ValueError as exc:
             self._write_json(400, {"error": str(exc)})
@@ -2887,6 +3752,27 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._write_json(200, {"ok": True})
                 return
 
+            if parsed.path == "/api/metrics":
+                # Observability: cumulative start.gg usage + derived-data cache stats.
+                gate = _rate_gate_metrics()
+                with _MEMO_LOCK:
+                    memo = dict(_MEMO_STATS)
+                    memo["entries"] = len(_MEMO)
+                self._write_json(200, {
+                    "startgg": gate,
+                    "derivedCache": memo,
+                    "warm": {k: WARM_STATE.get(k) for k in ("phase", "runs", "lastWarmedAt", "lastRequestCount")},
+                })
+                return
+
+            if parsed.path == "/api/cache/status":
+                with WARM_LOCK:
+                    state = dict(WARM_STATE)
+                state["coveragePct"] = round(_coverage_pct() * 100, 1)
+                state["paused"] = _warm_is_paused()
+                self._write_json(200, state)
+                return
+
             if parsed.path == "/api/debug/server-events":
                 since_raw = str(params.get("since", ["0"])[0] or "0")
                 try:
@@ -2906,12 +3792,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 query = str(params.get("query", [""])[0] or "")
                 max_players = int(str(params.get("maxPlayers", ["500"])[0]))
                 max_players = max(1, min(max_players, 5000))
+                force_refresh = str(params.get("forceRefresh", ["0"])[0] or "0").lower() in {"1", "true", "yes"}
                 payload = _build_elo_payload(
                     mode=mode,
                     start_date=start,
                     end_date=end,
                     query=query,
                     max_players=max_players,
+                    force_refresh=force_refresh,
                 )
                 self._write_json(200, payload)
                 return
@@ -2921,6 +3809,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 end = str(params.get("end", [""])[0] or "")
                 if not start or not end:
                     raise ValueError("start and end are required")
+                force_refresh = str(params.get("forceRefresh", ["0"])[0] or "0").lower() in {"1", "true", "yes"}
                 job_id = str(uuid.uuid4())
                 with JOB_LOCK:
                     DATE_RANGE_JOBS[job_id] = {
@@ -2933,7 +3822,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "result": None,
                         "error": None,
                     }
-                Thread(target=_date_range_worker, args=(job_id,), kwargs={"start": start, "end": end}, daemon=True).start()
+                Thread(target=_date_range_worker, args=(job_id,), kwargs={"start": start, "end": end, "force_refresh": force_refresh}, daemon=True).start()
                 self._write_json(200, {"jobId": job_id})
                 return
 
@@ -3067,12 +3956,31 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._write_json(200, payload)
                 return
 
+            if parsed.path == "/api/pr-maker/oor-stats":
+                # OOR pipeline observability: cache-layer counters (process
+                # lifetime) + rate-gate metrics. Benchmark scripts diff two
+                # snapshots to attribute requests/hits to one phase.
+                with _OOR_MEM_LOCK:
+                    mem_reports = len(_OOR_MEM_REPORTS)
+                    mem_standings = len(_OOR_MEM_STANDINGS)
+                self._write_json(200, {
+                    "counters": _oor_stats_snapshot(),
+                    "memCache": {"reports": mem_reports, "standings": mem_standings},
+                    "rateGate": _rate_gate_metrics(),
+                    "tuning": {
+                        "fetchConcurrency": OOR_FETCH_CONCURRENCY,
+                        "warmConcurrency": OOR_WARM_CONCURRENCY,
+                        "setsCacheTtlSec": _OOR_SETS_CACHE_TTL,
+                    },
+                })
+                return
+
             if parsed.path == "/api/calendar/day":
                 raw_date = str(params.get("date", [""])[0] or "")
                 sample = int(str(params.get("sampleRegistrants", ["10"])[0]))
                 sample = max(0, min(sample, 24))
                 target_day = _parse_iso_date(raw_date) if raw_date else _today_pacific()
-                cards = _build_calendar_cards(
+                cards = _build_calendar_cards_cached(
                     target_start=target_day,
                     target_end=target_day,
                     sample_registrants=sample,
@@ -3094,7 +4002,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 sample = max(0, min(sample, 24))
                 anchor_day = _parse_iso_date(raw_date) if raw_date else _today_pacific()
                 week_start, week_end = _week_bounds_sun_sat(anchor_day)
-                cards = _build_calendar_cards(
+                cards = _build_calendar_cards_cached(
                     target_start=week_start,
                     target_end=week_end,
                     sample_registrants=sample,
@@ -3165,7 +4073,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local API for NorCal Smash React UI")
     parser.add_argument("--host", default="127.0.0.1", help="Bind host")
-    parser.add_argument("--port", type=int, default=8765, help="Bind port")
+    parser.add_argument("--port", type=int, default=8775, help="Bind port")
     return parser.parse_args()
 
 
@@ -3173,6 +4081,9 @@ def main() -> None:
     args = parse_args()
     server = ThreadingHTTPServer((args.host, args.port), ApiHandler)
     print(f"[NorCal Smash API] serving on http://{args.host}:{args.port}")
+    warm_thread = Thread(target=_warm_worker, name="cache-warmer", daemon=True)
+    warm_thread.start()
+    print(f"[NorCal Smash API] background cache warming started (recent {WARM_RECENT_DAYS}d)")
     server.serve_forever()
 
 

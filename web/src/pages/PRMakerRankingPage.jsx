@@ -1,6 +1,30 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef, memo } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useDebugLog } from '../debug/DebugContext.jsx'
+import RankingListPanel from '../components/RankingListPanel.jsx'
+
+// Module-level comparison cache: revisiting a pair (back nav, restart, refresh
+// within the SPA session) renders instantly instead of refetching + restreaming.
+// Keyed by context fingerprint + sorted pair + whether OOR was included.
+const comparisonCache = new Map()
+const COMPARISON_CACHE_MAX = 300
+
+function comparisonCacheKey(ctx, pA, pB, withOor) {
+  const pair = [pA, pB].sort().join('|')
+  const ctxFp = JSON.stringify([
+    ctx.startDate, ctx.endDate,
+    [...(ctx.eventSlugs || [])].sort(),
+    ctx.mergeRules || [],
+  ])
+  return `${ctxFp}|${pair}|oor:${withOor ? 1 : 0}`
+}
+
+function comparisonCachePut(key, value) {
+  if (comparisonCache.size >= COMPARISON_CACHE_MAX) {
+    comparisonCache.delete(comparisonCache.keys().next().value)
+  }
+  comparisonCache.set(key, value)
+}
 
 function shuffleArray(arr) {
   const a = [...arr]
@@ -11,31 +35,146 @@ function shuffleArray(arr) {
   return a
 }
 
-/** Worst-case comparisons to build a total order via binary insertion (O(n log n)). */
+/**
+ * Worst-case comparisons for merge-insertion (Ford–Johnson) sort:
+ * F(n) = Σ_{k=1..n} ceil(log2(3k/4)). This matches the information-theoretic
+ * lower bound ceil(log2(n!)) for n ≤ 11 and n = 20..22 — i.e. it is the
+ * provably minimal worst-case question count for typical tier sizes.
+ */
 function maxComparisonsUpperBound(n) {
-  if (n <= 1) return 0
   let s = 0
-  for (let k = 1; k < n; k++) {
-    s += Math.ceil(Math.log2(k + 1))
+  for (let k = 1; k <= n; k++) {
+    // ceil(log2(3k/4)) computed exactly: smallest b with 2^(b+2) >= 3k
+    let bits = 0
+    while (1 << (bits + 2) < 3 * k) bits++
+    s += bits
   }
   return s
 }
 
-function buildInitialInsert(names) {
-  const shuffled = shuffleArray([...names])
-  if (shuffled.length === 0) return { ranking: [], pool: [], active: null }
-  if (shuffled.length === 1) return { ranking: [...shuffled], pool: [], active: null }
-  const ranking = [shuffled[0]]
-  const pool = shuffled.slice(1)
-  return {
-    ranking,
-    pool,
-    active: { player: pool[0], lo: 0, hi: ranking.length },
+const NEEDS_ANSWER = Symbol('needsAnswer')
+const INCONSISTENT_EDGES = Symbol('inconsistentEdges')
+
+/**
+ * Insertion order (indices into the pend array) for Ford–Johnson: elements are
+ * inserted in groups bounded by Jacobsthal numbers (3, 5, 11, 21, …),
+ * descending within each group, so every binary search spans 2^k − 1 elements
+ * in the worst case.
+ */
+function pendInsertionOrder(m) {
+  const order = []
+  let prevLabel = 1
+  let jPrev = 1
+  let jCur = 3
+  while (prevLabel < m + 1) {
+    const boundary = Math.min(jCur, m + 1)
+    for (let label = boundary; label > prevLabel; label--) order.push(label - 2)
+    prevLabel = boundary
+    const next = jCur + 2 * jPrev
+    jPrev = jCur
+    jCur = next
   }
+  return order
+}
+
+/** Ford–Johnson merge-insertion sort, ascending by `less`. */
+function fjSortAsc(items, less) {
+  const n = items.length
+  if (n <= 1) return [...items]
+  const pairs = [] // [high, low] with high > low
+  let straggler = null
+  for (let i = 0; i + 1 < n; i += 2) {
+    const a = items[i]
+    const b = items[i + 1]
+    if (less(a, b)) pairs.push([b, a])
+    else pairs.push([a, b])
+  }
+  if (n % 2 === 1) straggler = items[n - 1]
+  const sortedHighs = fjSortAsc(pairs.map((p) => p[0]), less)
+  const lowOf = new Map(pairs)
+  // The partner of the smallest sorted high is smaller than everything sorted
+  // so far — it leads the chain for free, without a comparison.
+  const chain = [lowOf.get(sortedHighs[0]), ...sortedHighs]
+  const pend = sortedHighs.slice(1).map((h) => ({ item: lowOf.get(h), partner: h }))
+  if (straggler != null) pend.push({ item: straggler, partner: null })
+  for (const pi of pendInsertionOrder(pend.length)) {
+    const { item, partner } = pend[pi]
+    let lo = 0
+    // item < partner, so the search never needs to look past the partner.
+    let hi = partner == null ? chain.length : chain.indexOf(partner)
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (less(item, chain[mid])) hi = mid
+      else lo = mid + 1
+    }
+    chain.splice(lo, 0, item)
+  }
+  return chain
+}
+
+/**
+ * Deterministically replay a tier's merge-insertion sort against the recorded
+ * answers. Returns { done: true, ranking } (best first) once every needed
+ * answer is recorded, or { done: false, nextPair: [a, b] } identifying the
+ * next question to ask.
+ */
+function computeTierSort(order, tierEdges) {
+  let i = 0
+  let pendingPair = null
+  const better = (x, y) => {
+    if (i < tierEdges.length) {
+      const e = tierEdges[i++]
+      const matches = (e.winner === x && e.loser === y) || (e.winner === y && e.loser === x)
+      if (!matches) throw INCONSISTENT_EDGES
+      return e.winner === x
+    }
+    pendingPair = [x, y]
+    throw NEEDS_ANSWER
+  }
+  try {
+    const ascending = fjSortAsc(order, (a, b) => better(b, a))
+    return { done: true, ranking: ascending.reverse() }
+  } catch (err) {
+    if (err === NEEDS_ANSWER) return { done: false, nextPair: pendingPair }
+    throw err
+  }
+}
+
+/**
+ * Derive the entire comparison flow state (current tier, finished rankings,
+ * next question) from the persisted shuffled orders + answer log.
+ */
+function computeCompareState(orders, edges) {
+  const completedRankings = []
+  for (let t = 0; t < orders.length; t++) {
+    const tierSet = new Set(orders[t])
+    const tierEdges = edges.filter((e) => tierSet.has(e.winner) || tierSet.has(e.loser))
+    const res = computeTierSort(orders[t], tierEdges)
+    if (!res.done) {
+      return { done: false, tierIndex: t, completedRankings, nextPair: res.nextPair }
+    }
+    completedRankings.push(...res.ranking)
+  }
+  return { done: true, tierIndex: orders.length, completedRankings, nextPair: null }
 }
 
 function namesFingerprint(names) {
   return JSON.stringify([...names].sort())
+}
+
+function tiersFingerprint(ctx) {
+  return JSON.stringify([namesFingerprint(ctx.selectedNames), ctx.tiers])
+}
+
+function validateTiers(ctx) {
+  if (!ctx?.tiers || !Array.isArray(ctx.tiers) || ctx.tiers.length === 0) return false
+  const selected = ctx.selectedNames || []
+  if (selected.length === 0) return false
+  const flat = ctx.tiers.flat()
+  if (flat.length !== selected.length) return false
+  const sortedFlat = [...flat].sort()
+  const sortedSel = [...selected].sort()
+  return sortedFlat.every((n, i) => n === sortedSel[i])
 }
 
 function orderedFromRankingAndEdges(ranking, edges, allNames) {
@@ -47,7 +186,7 @@ function orderedFromRankingAndEdges(ranking, edges, allNames) {
   return ranking.map((name) => ({ name, score: wins[name] ?? 0 }))
 }
 
-const STORAGE_INSERT = 'prMakerCompareInsert'
+const STORAGE_TIER_COMPARE = 'prMakerTierCompare'
 const STORAGE_EDGES = 'prMakerCompareEdges'
 const STORAGE_ALGO = 'prMakerCompareAlgo'
 const STORAGE_NAMES_FP = 'prMakerCompareNamesFp'
@@ -170,43 +309,81 @@ export default function PRMakerRankingPage() {
   const navigate = useNavigate()
   const ctx = useMemo(() => {
     const s = location.state
-    if (s && Array.isArray(s.selectedNames) && s.selectedNames.length >= 2) return s
-    try {
-      const raw = JSON.parse(sessionStorage.getItem('prMakerRankingContext'))
-      if (raw && Array.isArray(raw.selectedNames) && raw.selectedNames.length >= 2) return raw
-    } catch {}
-    return null
+    const raw = s || loadJson('prMakerRankingContext')
+    if (!raw || !Array.isArray(raw.selectedNames) || raw.selectedNames.length < 1) return null
+    if (!validateTiers(raw)) return { ...raw, _needsTiering: true }
+    return raw
   }, [location.state])
 
-  const [insertState, setInsertState] = useState(null)
+  useEffect(() => {
+    if (ctx?._needsTiering) {
+      navigate('/pr-maker/tiering', { state: ctx, replace: true })
+    }
+  }, [ctx, navigate])
+
+  // Persisted: the shuffled per-tier orders + the ordered answer log. Everything
+  // else (current tier, next question, final ranking) is replayed from these,
+  // so the merge-insertion engine stays a pure function.
+  const [orders, setOrders] = useState(null)
   const [edges, setEdges] = useState(() => loadJson(STORAGE_EDGES) || [])
 
   useEffect(() => {
-    if (!ctx) return
-    const fp = namesFingerprint(ctx.selectedNames)
+    if (!ctx || ctx._needsTiering) return
+    const fp = tiersFingerprint(ctx)
     const savedFp = loadJson(STORAGE_NAMES_FP)
-    const saved = loadJson(STORAGE_INSERT)
+    const savedOrders = loadJson(STORAGE_TIER_COMPARE)
     const algo = loadJson(STORAGE_ALGO)
-    if (saved && algo === 'v2' && savedFp === fp && saved.ranking && Array.isArray(saved.pool)) {
-      setInsertState(saved)
+    if (
+      Array.isArray(savedOrders) &&
+      algo === 'v4' &&
+      savedFp === fp &&
+      savedOrders.length === ctx.tiers.length
+    ) {
+      setOrders(savedOrders)
       const e = loadJson(STORAGE_EDGES)
-      if (Array.isArray(e)) setEdges(e)
+      setEdges(Array.isArray(e) ? e : [])
       return
     }
-    const st = buildInitialInsert(ctx.selectedNames)
-    setInsertState(st)
+    const fresh = ctx.tiers.map((tier) => shuffleArray(tier))
+    setOrders(fresh)
     setEdges([])
-    saveJson(STORAGE_INSERT, st)
+    saveJson(STORAGE_TIER_COMPARE, fresh)
     saveJson(STORAGE_EDGES, [])
-    saveJson(STORAGE_ALGO, 'v2')
+    saveJson(STORAGE_ALGO, 'v4')
     saveJson(STORAGE_NAMES_FP, fp)
   }, [ctx])
 
+  const compareState = useMemo(() => {
+    if (!orders) return null
+    try {
+      return computeCompareState(orders, edges)
+    } catch (err) {
+      if (err === INCONSISTENT_EDGES) return { corrupt: true }
+      throw err
+    }
+  }, [orders, edges])
+
+  // Saved answers that no longer replay cleanly (e.g. edited storage) can't be
+  // trusted — restart with a fresh shuffle rather than asking garbage questions.
+  useEffect(() => {
+    if (!compareState?.corrupt) return
+    dlog('warn', 'PRMaker/Ranking', 'Saved comparison answers do not match the replay — restarting comparisons')
+    handleRestart()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compareState])
+
+  const tierIndex = compareState?.tierIndex ?? 0
+  const tierCount = ctx?.tiers?.length ?? 0
   const n = ctx?.selectedNames?.length ?? 0
-  const maxTotal = useMemo(() => maxComparisonsUpperBound(n), [n])
+  const maxTotal = useMemo(
+    () => (ctx?.tiers || []).reduce((s, t) => s + maxComparisonsUpperBound(t.length), 0),
+    [ctx?.tiers],
+  )
+  const maxWithoutTiering = useMemo(() => maxComparisonsUpperBound(n), [n])
   const answered = edges.length
 
-  const isDone = insertState && insertState.pool.length === 0 && insertState.active == null && n >= 1
+  const isDone = compareState?.done === true
+  const fullRanking = compareState?.completedRankings ?? []
 
   const [card, setCard] = useState(null)
   const [expanded, setExpanded] = useState(null)
@@ -219,24 +396,23 @@ export default function PRMakerRankingPage() {
   const fetchCtrl = useRef(null)
   const cancelIdRef = useRef(null)
 
-  const active = insertState?.active
-  const ranking = insertState?.ranking ?? []
-  const mid = active && ranking.length > 0
-    ? Math.floor((active.lo + active.hi) / 2)
-    : 0
-  const pivot = active && ranking.length > 0 ? ranking[mid] : null
-  const pairPlayerA = active?.player ?? null
-  const pairPlayerB = pivot ?? null
-  const currentPair = pairPlayerA && pairPlayerB ? [pairPlayerA, pairPlayerB] : null
+  const currentPair = compareState && !compareState.done && !compareState.corrupt
+    ? compareState.nextPair
+    : null
+  const pairPlayerA = currentPair?.[0] ?? null
+  const pairPlayerB = currentPair?.[1] ?? null
 
   const fetchComparison = useCallback(async (pA, pB) => {
     if (fetchCtrl.current) fetchCtrl.current.abort()
     if (cancelIdRef.current) {
-      fetch('/api/pr-maker/oor-cancel', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cancelId: cancelIdRef.current }),
-      }).catch(() => {})
+      // Both parallel OOR streams: base id (player A) and "-b" suffix (player B).
+      for (const cidToCancel of [cancelIdRef.current, `${cancelIdRef.current}-b`]) {
+        fetch('/api/pr-maker/oor-cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cancelId: cidToCancel }),
+        }).catch(() => {})
+      }
     }
     const ctrl = new AbortController()
     fetchCtrl.current = ctrl
@@ -254,50 +430,78 @@ export default function PRMakerRankingPage() {
       start: ctx.startDate, end: ctx.endDate,
       eventSlugs: ctx.eventSlugs, mergeRules: ctx.mergeRules || [],
     }
+
+    // Full cache hit (incl. OOR): render instantly, no network at all.
+    const oorKey = comparisonCacheKey(ctx, pA, pB, true)
+    const cachedFull = comparisonCache.get(oorKey)
+    if (cachedFull) {
+      dlog('info', 'PRMaker/Ranking', `Comparison cache hit (with OOR) for ${pA} vs ${pB} — no fetch`)
+      setCard(cachedFull.card || null)
+      setExpanded(cachedFull.expanded || null)
+      setLoading(false)
+      setLoadPhase('')
+      return
+    }
+
     try {
+      // Phase 1: one round trip — in-region card + whatever OOR the server
+      // already has cached (memory → SQLite → granular rebuild, no start.gg).
+      // On a warm cache this is the *only* request for the whole comparison.
       const res = await fetch('/api/pr-maker/comparison', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...shared, playerA: pA, playerB: pB, includeOOR: false }),
+        body: JSON.stringify({ ...shared, playerA: pA, playerB: pB, includeOOR: true, oorCacheOnly: true }),
         signal: ctrl.signal,
       })
       const data = await res.json()
       if (ctrl.signal.aborted) return
-      dlog('info', 'PRMaker/Ranking', `In-region comparison loaded for ${pA} vs ${pB}`)
+      const missing = res.ok && Array.isArray(data.missingOOR) ? data.missingOOR : [pA, pB]
       setCard(data.card || null)
       setExpanded(data.expanded || null)
       setLoading(false)
 
-      setLoadPhase(`Fetching out-of-region data for ${pA}…`)
+      if (res.ok && missing.length === 0) {
+        dlog('info', 'PRMaker/Ranking', `Comparison loaded with full OOR from server cache (1 round trip) for ${pA} vs ${pB}`)
+        comparisonCachePut(oorKey, { card: data.card, expanded: data.expanded })
+        setLoadPhase('')
+        return
+      }
+      dlog('info', 'PRMaker/Ranking', `Comparison loaded; OOR still needed for: ${missing.join(', ')}`)
+
+      // Phase 2: stream OOR only for the players the cache is missing (parallel).
+      // The card above stays interactive — OOR fills in when ready.
+      setLoadPhase(`Fetching out-of-region data for ${missing.join(' and ')}…`)
       setOorProgressPct(0)
       try {
-        await streamPlayerOor(shared, pA, cid, ctrl.signal, {
-          dlog,
-          setPhaseLine: (msg) => setLoadPhase(`OOR (${pA}): ${msg}`),
-        })
+        let oorDone = 0
+        const trackDone = (player) => {
+          oorDone += 1
+          if (ctrl.signal.aborted) return
+          setOorProgressPct(Math.round((oorDone / missing.length) * 100))
+          dlog('info', 'PRMaker/Ranking', `OOR for ${player} done (${oorDone}/${missing.length})`)
+        }
+        await Promise.all(missing.map((player, idx) =>
+          streamPlayerOor(shared, player, idx === 0 ? cid : `${cid}-b`, ctrl.signal, {
+            dlog,
+            setPhaseLine: (msg) => setLoadPhase(`OOR (${player}): ${msg}`),
+          }).then(() => trackDone(player)),
+        ))
         if (ctrl.signal.aborted) return
-        dlog('info', 'PRMaker/Ranking', `OOR for ${pA} done (50%) — stream finished`)
-        setOorProgressPct(50)
-        setLoadPhase(`Fetching out-of-region data for ${pB}…`)
-
-        await streamPlayerOor(shared, pB, cid, ctrl.signal, {
-          dlog,
-          setPhaseLine: (msg) => setLoadPhase(`OOR (${pB}): ${msg}`),
-        })
-        if (ctrl.signal.aborted) return
-        dlog('info', 'PRMaker/Ranking', `OOR for ${pB} done (100%) — loading OOR comparison`)
-        setOorProgressPct(100)
         setLoadPhase('Loading comparison with out-of-region data…')
 
+        // Phase 3: cache-only again — everything is now cached server-side.
         const oorRes = await fetch('/api/pr-maker/comparison', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...shared, playerA: pA, playerB: pB, includeOOR: true }),
+          body: JSON.stringify({ ...shared, playerA: pA, playerB: pB, includeOOR: true, oorCacheOnly: true }),
           signal: ctrl.signal,
         })
         const oorData = await oorRes.json()
         if (!ctrl.signal.aborted) {
           dlog('info', 'PRMaker/Ranking', `OOR comparison loaded for ${pA} vs ${pB}`)
+          if (oorRes.ok && (!oorData.missingOOR || oorData.missingOOR.length === 0)) {
+            comparisonCachePut(oorKey, { card: oorData.card, expanded: oorData.expanded })
+          }
           setCard(oorData.card || null)
           setExpanded(oorData.expanded || null)
         }
@@ -321,50 +525,89 @@ export default function PRMakerRankingPage() {
     }
   }, [pairPlayerA, pairPlayerB, ctx, fetchComparison])
 
-  function persistInsert(next) {
-    setInsertState(next)
-    saveJson(STORAGE_INSERT, next)
-  }
+  const prevPairRef = useRef(null)
+  useEffect(() => {
+    if (!pairPlayerA || !pairPlayerB) return
+    const pairKey = `${pairPlayerA}|${pairPlayerB}`
+    if (prevPairRef.current && prevPairRef.current !== pairKey) {
+      window.scrollTo({ top: 0, behavior: 'smooth' })
+    }
+    prevPairRef.current = pairKey
+  }, [pairPlayerA, pairPlayerB])
 
-  function recordComparison(insertingPlayerWins) {
-    if (!insertState?.active || pivot == null) return
-    const { player, lo, hi } = insertState.active
-    dlog('info', 'PRMaker/Ranking', `Decision: ${insertingPlayerWins ? player + ' > ' + pivot : pivot + ' > ' + player} (lo=${lo}, hi=${hi}, mid=${mid})`)
-    const newEdges = [...edges, {
-      winner: insertingPlayerWins ? player : pivot,
-      loser: insertingPlayerWins ? pivot : player,
-    }]
+  // Speculative prefetch: once the current card is settled, warm the two pairs
+  // the user can land on next. The pairs come from replaying the engine with
+  // each hypothetical answer appended, so this stays correct for any algorithm.
+  // Cache-only requests never hit start.gg; any players still missing OOR get
+  // a background warm job (resumable, prioritized).
+  const prefetchedRef = useRef(new Set())
+  useEffect(() => {
+    if (!ctx || !card || loadPhase || !currentPair || !orders) return
+    const [a, b] = currentPair
+    const nextPairs = []
+    for (const firstWins of [true, false]) {
+      const hypothetical = [...edges, {
+        winner: firstWins ? a : b,
+        loser: firstWins ? b : a,
+      }]
+      try {
+        const st = computeCompareState(orders, hypothetical)
+        if (!st.done && st.nextPair) nextPairs.push(st.nextPair)
+      } catch { /* inconsistent hypothetical state — skip prefetch */ }
+    }
+    if (nextPairs.length === 0) return
+
+    const shared = {
+      start: ctx.startDate, end: ctx.endDate,
+      eventSlugs: ctx.eventSlugs, mergeRules: ctx.mergeRules || [],
+    }
+    const missingForWarm = new Set()
+    const tasks = []
+    for (const [npA, npB] of nextPairs) {
+      const key = comparisonCacheKey(ctx, npA, npB, true)
+      if (comparisonCache.has(key) || prefetchedRef.current.has(key)) continue
+      prefetchedRef.current.add(key)
+      tasks.push(
+        fetch('/api/pr-maker/comparison', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...shared, playerA: npA, playerB: npB, includeOOR: true, oorCacheOnly: true }),
+        })
+          .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
+          .then(({ ok, d }) => {
+            const miss = ok && Array.isArray(d.missingOOR) ? d.missingOOR : []
+            if (ok && miss.length === 0) {
+              comparisonCachePut(key, { card: d.card, expanded: d.expanded })
+              dlog('info', 'PRMaker/Ranking', `Prefetched next pair ${npA} vs ${npB} (full cache)`)
+            } else {
+              for (const m of miss) missingForWarm.add(m)
+            }
+          })
+          .catch(() => {}),
+      )
+    }
+    if (tasks.length === 0) return
+    Promise.all(tasks).then(() => {
+      if (missingForWarm.size === 0) return
+      const names = [...missingForWarm]
+      dlog('info', 'PRMaker/Ranking', `Background OOR warm for likely-next players: ${names.join(', ')}`)
+      fetch('/api/pr-maker/oor-warm/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...shared, names }),
+      }).catch(() => {})
+    })
+  }, [ctx, card, loadPhase, currentPair, orders, edges, dlog])
+
+  function recordComparison(firstWins) {
+    if (!currentPair) return
+    const [a, b] = currentPair
+    const winner = firstWins ? a : b
+    const loser = firstWins ? b : a
+    dlog('info', 'PRMaker/Ranking', `Decision: ${winner} > ${loser} (answer ${edges.length + 1})`)
+    const newEdges = [...edges, { winner, loser }]
     setEdges(newEdges)
     saveJson(STORAGE_EDGES, newEdges)
-
-    let newLo = lo
-    let newHi = hi
-    if (insertingPlayerWins) {
-      newHi = mid
-    } else {
-      newLo = mid + 1
-    }
-
-    if (newLo < newHi) {
-      persistInsert({
-        ...insertState,
-        active: { player, lo: newLo, hi: newHi },
-      })
-      return
-    }
-
-    const newRanking = [...insertState.ranking]
-    newRanking.splice(newLo, 0, player)
-    const newPool = insertState.pool.slice(1)
-    let newActive = null
-    if (newPool.length > 0) {
-      newActive = { player: newPool[0], lo: 0, hi: newRanking.length }
-    }
-    persistInsert({
-      ranking: newRanking,
-      pool: newPool,
-      active: newActive,
-    })
   }
 
   async function generateArgument() {
@@ -397,82 +640,94 @@ export default function PRMakerRankingPage() {
   }
 
   function handleRestart() {
-    if (!ctx) return
-    const st = buildInitialInsert(ctx.selectedNames)
-    setInsertState(st)
+    if (!ctx?.tiers) return
+    const fresh = ctx.tiers.map((tier) => shuffleArray(tier))
+    setOrders(fresh)
     setEdges([])
-    saveJson(STORAGE_INSERT, st)
+    saveJson(STORAGE_TIER_COMPARE, fresh)
     saveJson(STORAGE_EDGES, [])
-    saveJson(STORAGE_NAMES_FP, namesFingerprint(ctx.selectedNames))
-    saveJson(STORAGE_ALGO, 'v2')
+    saveJson(STORAGE_NAMES_FP, tiersFingerprint(ctx))
+    saveJson(STORAGE_ALGO, 'v4')
     setCard(null)
     setExpanded(null)
     setArgText('')
     setArgPanelOpen(false)
+    prevPairRef.current = null
+    window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
-  if (!ctx) {
+  if (!ctx || ctx._needsTiering) {
     return (
       <main className="process-page" aria-label="PR Maker — Data Explorer">
         <div className="process-page-inner">
           <h2 className="panel-title">PR Maker</h2>
           <p className="process-subtitle" style={{ marginTop: 12 }}>
-            No context found. Please go through the candidate selection first.
+            {ctx?._needsTiering ? 'Redirecting to tiering…' : 'No context found. Please go through the candidate selection first.'}
           </p>
-          <Link to="/pr-maker/candidates" className="pr-maker-back-link">← Back to candidates</Link>
+          {!ctx?._needsTiering ? (
+            <Link to="/pr-maker/candidates" className="pr-maker-back-link">← Back to candidates</Link>
+          ) : null}
         </div>
       </main>
     )
   }
 
   function handleContinueToFinal() {
-    const ordered = orderedFromRankingAndEdges(insertState.ranking, edges, ctx.selectedNames)
+    const ordered = orderedFromRankingAndEdges(fullRanking, edges, ctx.selectedNames)
     dlog('info', 'PRMaker/Ranking', `Continue to final — ${ordered.length} players ranked`)
     const payload = { ordered, edges }
     try { sessionStorage.setItem('prMakerFinalSnapshot', JSON.stringify(payload)) } catch {}
+    // Prefetch the final CSV in the background while the user reads the final
+    // page — the warm caches make this server-cheap, and the export button
+    // becomes instant. Stale prefetches are cleared first.
+    try { sessionStorage.removeItem('prMakerPrefetchedCsv') } catch {}
+    fetch('/api/pr-maker/final-export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        start: ctx.startDate, end: ctx.endDate,
+        eventSlugs: ctx.eventSlugs, mergeRules: ctx.mergeRules || [],
+        ranking: ordered.map((p) => ({ name: p.name, copelandScore: p.score })),
+      }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d && d.csv) {
+          try {
+            sessionStorage.setItem('prMakerPrefetchedCsv', d.csv)
+            dlog('info', 'PRMaker/Ranking', 'Final CSV prefetched and stored for instant export')
+          } catch {}
+        }
+      })
+      .catch(() => {})
     navigate('/pr-maker/final', { state: payload })
   }
 
   if (isDone) {
-    const ordered = orderedFromRankingAndEdges(insertState.ranking, edges, ctx.selectedNames)
+    const ordered = orderedFromRankingAndEdges(fullRanking, edges, ctx.selectedNames)
     return (
-      <main className="process-page" aria-label="PR Maker — Results">
-        <div className="process-page-inner">
-          <h2 className="panel-title">PR Maker</h2>
-          <p className="process-subtitle">Data Explorer: Complete</p>
-          <p className="compare-done-note">
-            Full ranking built in {answered} comparison{answered === 1 ? '' : 's'}
-            {maxTotal > 0 ? ` (at most ${maxTotal} needed in worst case for ${n} players).` : '.'}
-          </p>
-          <div className="compare-results-table-wrap">
-            <table className="compare-results-table">
-              <thead>
-                <tr><th>#</th><th>Player</th><th>Head-to-head wins</th></tr>
-              </thead>
-              <tbody>
-                {ordered.map((s, i) => (
-                  <tr key={s.name}>
-                    <td>{i + 1}</td>
-                    <td>{s.name}</td>
-                    <td>{s.score}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+      <main className="process-page final-page" aria-label="PR Maker — Results">
+        <div className="process-page-inner final-inner">
+          <header className="final-hero">
+            <h2 className="panel-title">PR Maker</h2>
+            <p className="process-subtitle">Comparisons complete</p>
+          </header>
+
+          <RankingListPanel ordered={ordered} />
+
           <div className="compare-done-actions">
             <button type="button" className="compare-btn compare-btn-a" onClick={handleContinueToFinal}>
               Continue to final list
             </button>
             <button type="button" className="compare-restart-btn" onClick={handleRestart}>Restart comparisons</button>
-            <Link to="/pr-maker/candidates" className="pr-maker-back-link">← Back to candidates</Link>
+            <Link to="/pr-maker/tiering" className="pr-maker-back-link">← Back to tiering</Link>
           </div>
         </div>
       </main>
     )
   }
 
-  if (!insertState || !currentPair) {
+  if (!isDone && !currentPair) {
     return (
       <main className="process-page" aria-label="PR Maker — Loading">
         <div className="process-page-inner">
@@ -496,7 +751,9 @@ export default function PRMakerRankingPage() {
       <main className="process-page compare-page" aria-label="PR Maker — Data Explorer">
         <div className="process-page-inner compare-inner">
           <h2 className="panel-title">PR Maker</h2>
-          <p className="process-subtitle">Comparison</p>
+          <p className="process-subtitle">
+            Comparison · Tier {Math.min(tierIndex + 1, tierCount)} of {tierCount}
+          </p>
 
           <div className="compare-header-row">
             <span className="compare-player-name compare-player-a">{pA}</span>
@@ -532,7 +789,7 @@ export default function PRMakerRankingPage() {
 
           {argLoading ? (
             <div className="compare-arg-loading-dock" role="status" aria-live="polite">
-              <p className="compare-arg-loading-title">Calling OpenAI (one request, in-region stats only)…</p>
+              <p className="compare-arg-loading-title">Calling local Gemma model (one request, in-region stats only)…</p>
               <div className="compare-arg-loading-track">
                 <div className="compare-arg-loading-fill compare-arg-loading-fill--indeterminate" />
               </div>
@@ -618,7 +875,9 @@ function StatRow({ label, valA, valB }) {
   )
 }
 
-function ComparisonBody({ card, expanded, pA, pB }) {
+// Memoized: OOR stream progress updates loadPhase several times per second and
+// would otherwise re-render this whole stat card on every NDJSON line.
+const ComparisonBody = memo(function ComparisonBody({ card, expanded, pA, pB }) {
   const inA = card.in_region_summary?.[pA] || {}
   const inB = card.in_region_summary?.[pB] || {}
   const outA = card.out_region_summary?.[pA] || {}
@@ -660,7 +919,7 @@ function ComparisonBody({ card, expanded, pA, pB }) {
           />
           {expanded?.tournamentsBothAttended != null ? (
             <StatRow
-              label="Tournaments Both Attended"
+              label="Shared Brackets"
               valA={expanded.tournamentsBothAttended.length}
               valB={expanded.tournamentsBothAttended.length}
             />
@@ -709,16 +968,21 @@ function ComparisonBody({ card, expanded, pA, pB }) {
       ) : null}
 
       {expanded?.tournamentsBothAttended?.length > 0 ? (
-        <CollapsibleSection title={`Tournaments both attended (${expanded.tournamentsBothAttended.length})`} defaultOpen>
+        <CollapsibleSection title={`Shared brackets (${expanded.tournamentsBothAttended.length})`} defaultOpen>
           <div className="compare-tourney-list">
-            {expanded.tournamentsBothAttended.map((t, i) => (
-              <div key={i} className="compare-tourney-row">
-                <div className="compare-tourney-name">{t.name}</div>
-                <div className="compare-tourney-detail">
-                  <span className="compare-player-a">{pA}</span>: {t.p1Place != null ? `#${t.p1Place}` : '—'} · {t.p1WL} · {t.p1Events} bracket{t.p1Events !== 1 ? 's' : ''}
+            {expanded.tournamentsBothAttended.map((t) => (
+              <div key={t.eventSlug || `${t.name}-${t.bracket}`} className="compare-tourney-row">
+                <div className="compare-tourney-name">
+                  {t.name}
+                  {t.bracket && t.bracket.toLowerCase() !== t.name?.toLowerCase() ? (
+                    <span className="compare-tourney-bracket"> · {t.bracket}</span>
+                  ) : null}
                 </div>
                 <div className="compare-tourney-detail">
-                  <span className="compare-player-b">{pB}</span>: {t.p2Place != null ? `#${t.p2Place}` : '—'} · {t.p2WL} · {t.p2Events} bracket{t.p2Events !== 1 ? 's' : ''}
+                  <span className="compare-player-a">{pA}</span>: {t.p1Place != null ? `#${t.p1Place}` : '—'} · {t.p1WL}
+                </div>
+                <div className="compare-tourney-detail">
+                  <span className="compare-player-b">{pB}</span>: {t.p2Place != null ? `#${t.p2Place}` : '—'} · {t.p2WL}
                 </div>
               </div>
             ))}
@@ -750,7 +1014,7 @@ function ComparisonBody({ card, expanded, pA, pB }) {
       ) : null}
     </div>
   )
-}
+})
 
 function CollapsibleSection({ title, defaultOpen = false, children }) {
   const [open, setOpen] = useState(defaultOpen)
@@ -813,7 +1077,11 @@ function OorCol({ label, items }) {
     <div className="compare-oor-col">
       <h5 className="compare-oor-title">{label}</h5>
       <ul className="compare-oor-items">
-        {items.map((name, i) => <li key={i}>{String(name)}</li>)}
+        {items.map((item, i) => {
+          const name = Array.isArray(item) ? item[0] : String(item)
+          const count = Array.isArray(item) ? item[1] : null
+          return <li key={i}>{name}{count != null ? ` (${count})` : ''}</li>
+        })}
       </ul>
     </div>
   )

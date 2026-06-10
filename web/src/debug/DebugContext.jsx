@@ -117,13 +117,18 @@ export function DebugProvider({ children }) {
           const elapsed = (performance.now() - startMs).toFixed(0)
           let detail = `${res.status} ${res.statusText} · ${elapsed}ms`
           try {
-            const clone = res.clone()
             const ct = res.headers.get('content-type') || ''
-            if (ct.includes('json') && !ct.includes('ndjson')) {
+            const len = Number(res.headers.get('content-length') || 0)
+            if (ct.includes('ndjson')) {
+              detail += ' · NDJSON stream (body not parsed in debug log)'
+            } else if (len > 100_000) {
+              // Cloning + re-parsing large payloads (full ELO table, candidate
+              // exports) doubles the JSON work just for a one-line summary.
+              detail += ` · ${(len / 1024).toFixed(0)}KB JSON (too large to summarize in debug log)`
+            } else if (ct.includes('json')) {
+              const clone = res.clone()
               const json = await clone.json()
               detail += ' · ' + summarizeJson(url, json)
-            } else if (ct.includes('ndjson')) {
-              detail += ' · NDJSON stream (body not parsed in debug log)'
             }
           } catch {}
           logRef.current(res.ok ? 'info' : 'warn', 'fetch', `← ${method} ${url}`, detail)

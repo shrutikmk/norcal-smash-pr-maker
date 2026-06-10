@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useDebugLog } from '../debug/DebugContext.jsx'
 
@@ -82,14 +82,23 @@ function buildDuplicateGroupsSorted(duplicates, sortOrder) {
   return groups
 }
 
-function ProcessEventRow({ ev, checked, onToggle, duplicateSection }) {
+// Memoized: toggling one checkbox in a list of hundreds should not re-render
+// every other row (onToggle is a stable useCallback).
+const ProcessEventRow = memo(function ProcessEventRow({
+  ev,
+  checked,
+  isIneligible,
+  onToggle,
+  onToggleIneligible,
+  duplicateSection,
+}) {
   const showBracket =
     duplicateSection &&
     ev.eventName &&
     ev.eventName !== '(unknown event)'
   return (
     <li
-      className={`process-event-row${duplicateSection ? ' process-event-row--duplicate' : ''}`}
+      className={`process-event-row${duplicateSection ? ' process-event-row--duplicate' : ''}${isIneligible ? ' process-event-row--ineligible' : ''}`}
     >
       <label className="process-event-checkbox-wrap">
         <input
@@ -114,9 +123,36 @@ function ProcessEventRow({ ev, checked, onToggle, duplicateSection }) {
           <span className="process-event-meta process-event-meta--bracket">{ev.eventName}</span>
         ) : null}
       </a>
+      <button
+        type="button"
+        className={`process-ineligible-btn${isIneligible ? ' process-ineligible-btn--active' : ''}`}
+        aria-label={isIneligible ? 'Marked ineligible — click to clear' : 'Mark ineligible for manual parsing'}
+        aria-pressed={isIneligible}
+        title={isIneligible ? 'Ineligible — excluded by default on future runs' : 'Mark ineligible (excluded by default on future runs)'}
+        onClick={() => onToggleIneligible(ev.eventSlug, !isIneligible)}
+      >
+        <svg className="process-ineligible-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path
+            className="process-ineligible-triangle"
+            d="M12 3.5L21.5 20H2.5L12 3.5Z"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinejoin="round"
+          />
+          <path
+            className="process-ineligible-mark"
+            d="M12 9v5.5M12 17.25v.75"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.75"
+            strokeLinecap="round"
+          />
+        </svg>
+      </button>
     </li>
   )
-}
+})
 
 export default function PRMakerProcessPage() {
   const dlog = useDebugLog()
@@ -130,6 +166,7 @@ export default function PRMakerProcessPage() {
   const [sortOrder, setSortOrder] = useState(DEFAULT_SORT_ORDER)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
+  const [ineligibleError, setIneligibleError] = useState('')
 
   const [processJobId, setProcessJobId] = useState(null)
   const [processStatus, setProcessStatus] = useState(null)
@@ -159,9 +196,14 @@ export default function PRMakerProcessPage() {
         if (!res.ok) throw new Error(data.error || 'Failed to load events')
         if (cancelled) return
         const evts = data.events || []
-        dlog('info', 'PRMaker/Process', `Loaded ${evts.length} cached events, all selected by default`)
+        const defaultSelected = evts.filter((e) => !e.isIneligible).map((e) => e.eventSlug)
+        dlog(
+          'info',
+          'PRMaker/Process',
+          `Loaded ${evts.length} cached events, ${defaultSelected.length} selected (${evts.length - defaultSelected.length} ineligible by default)`
+        )
         setEvents(evts)
-        setSelected(new Set(evts.map((e) => e.eventSlug)))
+        setSelected(new Set(defaultSelected))
       } catch (err) {
         if (!cancelled) setLoadError(err instanceof Error ? err.message : 'Load failed')
       } finally {
@@ -211,6 +253,47 @@ export default function PRMakerProcessPage() {
       return next
     })
   }, [])
+
+  const toggleIneligible = useCallback(async (slug, nextIneligible) => {
+    setIneligibleError('')
+    setEvents((prev) =>
+      prev.map((ev) => (ev.eventSlug === slug ? { ...ev, isIneligible: nextIneligible } : ev))
+    )
+    if (nextIneligible) {
+      setSelected((prev) => {
+        if (!prev.has(slug)) return prev
+        const next = new Set(prev)
+        next.delete(slug)
+        return next
+      })
+    }
+    try {
+      const res = await fetch('/api/pr-maker/events/ineligible', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ eventSlug: slug, ineligible: nextIneligible }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to update ineligible flag')
+      dlog(
+        'info',
+        'PRMaker/Process',
+        `${nextIneligible ? 'Marked' : 'Cleared'} ineligible: ${slug}`
+      )
+    } catch (err) {
+      setEvents((prev) =>
+        prev.map((ev) => (ev.eventSlug === slug ? { ...ev, isIneligible: !nextIneligible } : ev))
+      )
+      if (nextIneligible) {
+        setSelected((prev) => {
+          const next = new Set(prev)
+          next.add(slug)
+          return next
+        })
+      }
+      setIneligibleError(err instanceof Error ? err.message : 'Failed to update ineligible flag')
+    }
+  }, [dlog])
 
   const selectAll = useCallback(() => {
     setSelected(new Set(events.map((e) => e.eventSlug)))
@@ -358,6 +441,9 @@ export default function PRMakerProcessPage() {
                     </button>
                   </div>
                 </div>
+                {ineligibleError ? (
+                  <p className="error process-ineligible-error">{ineligibleError}</p>
+                ) : null}
 
                 <ul className="process-event-list">
                   {singletonSorted.map((ev) => (
@@ -365,7 +451,9 @@ export default function PRMakerProcessPage() {
                       key={ev.eventSlug}
                       ev={ev}
                       checked={selected.has(ev.eventSlug)}
+                      isIneligible={Boolean(ev.isIneligible)}
                       onToggle={toggleEvent}
+                      onToggleIneligible={toggleIneligible}
                       duplicateSection={false}
                     />
                   ))}
@@ -394,7 +482,9 @@ export default function PRMakerProcessPage() {
                               key={ev.eventSlug}
                               ev={ev}
                               checked={selected.has(ev.eventSlug)}
+                              isIneligible={Boolean(ev.isIneligible)}
                               onToggle={toggleEvent}
+                              onToggleIneligible={toggleIneligible}
                               duplicateSection
                             />
                           )),

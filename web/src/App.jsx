@@ -6,6 +6,7 @@ import CalendarPage from './pages/CalendarPage.jsx'
 import PRMakerPage from './pages/PRMakerPage.jsx'
 import PRMakerProcessPage from './pages/PRMakerProcessPage.jsx'
 import PRMakerCandidatesPage from './pages/PRMakerCandidatesPage.jsx'
+import PRMakerTieringPage from './pages/PRMakerTieringPage.jsx'
 import PRMakerRankingPage from './pages/PRMakerRankingPage.jsx'
 import PRMakerFinalPage from './pages/PRMakerFinalPage.jsx'
 import './App.css'
@@ -20,6 +21,7 @@ export default function App() {
           <Route path="pr-maker" element={<PRMakerPage />} />
           <Route path="pr-maker/process" element={<PRMakerProcessPage />} />
           <Route path="pr-maker/candidates" element={<PRMakerCandidatesPage />} />
+          <Route path="pr-maker/tiering" element={<PRMakerTieringPage />} />
           <Route path="pr-maker/ranking" element={<PRMakerRankingPage />} />
           <Route path="pr-maker/final" element={<PRMakerFinalPage />} />
         </Route>

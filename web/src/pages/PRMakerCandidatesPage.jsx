@@ -356,13 +356,13 @@ export default function PRMakerCandidatesPage() {
     }
   }
 
-  function handleProceedToRanking() {
+  function handleProceedToTiering() {
     const names = visible.filter((p) => selected.has(p.name)).map((p) => p.name)
-    dlog('info', 'PRMaker/Candidates', `Proceeding to ranking with ${names.length} candidates: ${names.join(', ')}`)
+    dlog('info', 'PRMaker/Candidates', `Proceeding to tiering with ${names.length} candidates: ${names.join(', ')}`)
     fireWarm(names)
     const payload = { startDate: ctx?.startDate, endDate: ctx?.endDate, eventSlugs: ctx?.eventSlugs, selectedNames: names, mergeRules }
-    try { sessionStorage.setItem('prMakerRankingContext', JSON.stringify(payload)) } catch {}
-    navigate('/pr-maker/ranking', { state: payload })
+    try { sessionStorage.setItem('prMakerTieringContext', JSON.stringify(payload)) } catch {}
+    navigate('/pr-maker/tiering', { state: payload })
   }
 
   if (!ctx) {
@@ -638,9 +638,9 @@ export default function PRMakerCandidatesPage() {
               type="button"
               className="process-ingest-btn"
               disabled={selectedCount === 0}
-              onClick={handleProceedToRanking}
+              onClick={handleProceedToTiering}
             >
-              Continue to comparisons — {selectedCount} Candidate{selectedCount === 1 ? '' : 's'}
+              Continue to tiering — {selectedCount} candidate{selectedCount === 1 ? '' : 's'}
             </button>
           </div>
         </>
