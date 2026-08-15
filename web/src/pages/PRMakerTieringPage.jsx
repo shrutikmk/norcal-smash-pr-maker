@@ -264,8 +264,10 @@ function TieringWorkspace({ ctx }) {
     [tiers],
   )
   const totalCount = ctx.selectedNames.length
-  const nonEmptyTierCount = tiers.filter((t) => t.names.length > 0).length
-  const canProceed = pool.length === 0 && assignedCount === totalCount && totalCount > 0
+  /** Explicit non-empty tiers + unassigned pool as an implicit bottom tier. */
+  const effectiveTierCount =
+    tiers.filter((t) => t.names.length > 0).length + (pool.length > 0 ? 1 : 0)
+  const canProceed = totalCount > 0 && assignedCount + pool.length === totalCount
 
   function clearCompareSession() {
     for (const key of COMPARE_KEYS) {
@@ -277,13 +279,20 @@ function TieringWorkspace({ ctx }) {
     }
   }
 
+  function buildEffectiveTiers() {
+    const tierNames = tiers.filter((t) => t.names.length > 0).map((t) => [...t.names])
+    if (pool.length > 0) tierNames.push([...pool])
+    return tierNames
+  }
+
   function handleProceed() {
     if (!canProceed) return
-    const tierNames = tiers.map((t) => [...t.names])
+    const tierNames = buildEffectiveTiers()
     dlog(
       'info',
       'PRMaker/Tiering',
-      `Proceeding — ${totalCount} candidates in ${nonEmptyTierCount} non-empty tier(s)`,
+      `Proceeding — ${totalCount} candidates in ${tierNames.length} tier(s)` +
+        (pool.length > 0 ? ` (incl. ${pool.length} unassigned as bottom tier)` : ''),
     )
     const payload = {
       startDate: ctx.startDate,
@@ -306,7 +315,8 @@ function TieringWorkspace({ ctx }) {
             <h2 className="panel-title">PR Maker</h2>
             <p className="process-subtitle">Tiering</p>
             <p className="candidates-scope-hint">
-              Drag candidates into tiers (Tier 1 = highest). Comparisons run only within each tier.
+              Drag candidates into tiers (Tier 1 = highest). Leave anyone in Unassigned for the
+              bottom tier. Comparisons run only within each tier.
               {' · '}
               {ctx.startDate} — {ctx.endDate}
               {' · '}
@@ -358,7 +368,7 @@ function TieringWorkspace({ ctx }) {
             <aside className="tiering-pool-column">
               <DropZone
                 zoneId="pool"
-                label="Unassigned"
+                label="Unassigned · bottom tier"
                 badge={pool.length > 0 ? String(pool.length) : null}
                 names={pool}
                 selectedChip={selectedChip}
@@ -369,7 +379,7 @@ function TieringWorkspace({ ctx }) {
                 onSelectChip={handleSelectChip}
                 onDragStart={handleDragStart}
                 onDragEnd={handleDragEnd}
-                emptyHint="All candidates assigned"
+                emptyHint="Everyone is in an explicit tier"
               />
             </aside>
           </div>
@@ -384,8 +394,8 @@ function TieringWorkspace({ ctx }) {
       <div className="process-bottom-bar">
         <span className="tiering-bottom-status">
           {pool.length > 0
-            ? `${pool.length} unassigned — assign all before continuing`
-            : `${assignedCount} candidates in ${nonEmptyTierCount} tier${nonEmptyTierCount === 1 ? '' : 's'}`}
+            ? `${assignedCount} in tiers · ${pool.length} unassigned (bottom tier)`
+            : `${assignedCount} candidates in ${effectiveTierCount} tier${effectiveTierCount === 1 ? '' : 's'}`}
         </span>
         <button
           type="button"
@@ -394,7 +404,9 @@ function TieringWorkspace({ ctx }) {
           onClick={handleProceed}
         >
           Proceed to comparisons — {totalCount} candidate{totalCount === 1 ? '' : 's'}
-          {nonEmptyTierCount > 0 ? ` in ${nonEmptyTierCount} tier${nonEmptyTierCount === 1 ? '' : 's'}` : ''}
+          {effectiveTierCount > 0
+            ? ` in ${effectiveTierCount} tier${effectiveTierCount === 1 ? '' : 's'}`
+            : ''}
         </button>
       </div>
     </>

@@ -108,18 +108,26 @@ python3 tools/llm_client.py --diagnose-only
 
 ## Run locally (development)
 
-**One command (vLLM + API + Vite)** — same pattern as the [scheduler](https://github.com/shrutikmk/scheduler) local stack:
+Primary path (do not use ad-hoc `npm run dev` / `python3 tools/web_api.py` as the operator story):
 
 ```bash
-./scripts/pr-maker-local-stack.sh start   # background; logs under scripts/.pr-maker-stack/logs/
-./scripts/pr-maker-local-stack.sh status
-./scripts/pr-maker-local-stack.sh logs
-./scripts/pr-maker-local-stack.sh stop
+./scripts/pr-maker-local-stack.sh restart
 ```
 
-Set `PR_MAKER_SKIP_VLLM=1` to require an external vLLM without auto-probing, or `PR_MAKER_SKIP_WEB=1` to start only vLLM + API. When the [scheduler](https://github.com/shrutikmk/scheduler) stack is already running, this script **reuses vLLM on port 8000** and binds the PR Maker API on **8775** (scheduler web UI uses 8765).
+Then open **http://127.0.0.1:5173/**. The script activates the vLLM Metal venv, starts the Python API on **8775**, and Vite on **5173**. If the [scheduler](https://github.com/shrutikmk/scheduler) stack is already up, it **reuses vLLM on port 8000** instead of launching a second copy.
 
-**Manual (two terminals)** — API first, then the Vite dev server (proxies `/api` to the API).
+| Command | Behavior |
+|---------|----------|
+| `./scripts/pr-maker-local-stack.sh start` | Background vLLM (if needed) + API + Vite; wait for health; print URLs |
+| `./scripts/pr-maker-local-stack.sh stop` | SIGTERM → SIGKILL from pidfile; free API/Vite ports; clear pidfile |
+| `./scripts/pr-maker-local-stack.sh restart` | Full stop then start |
+| `./scripts/pr-maker-local-stack.sh status` | Each named pid: running / not running |
+| `./scripts/pr-maker-local-stack.sh logs` | `tail -f` service logs |
+| `./scripts/pr-maker-local-stack.sh run` | Start + foreground log tail; Ctrl+C stops the stack |
+
+Logs and pidfile live under `scripts/.pr-maker-stack/` (gitignored). Set `PR_MAKER_SKIP_VLLM=1` to require an external vLLM, or `PR_MAKER_SKIP_WEB=1` for API + vLLM only. Override ports with `PR_MAKER_API_PORT` / `PR_MAKER_WEB_PORT`.
+
+**Manual (two terminals)** — only if you are not using the stack script. API first, then the Vite dev server (proxies `/api` to the API).
 
 **Terminal 1 — API (default `http://127.0.0.1:8775`)**
 
@@ -192,7 +200,7 @@ Rotate it in the [start.gg](https://developer.start.gg/) dashboard. For leaked h
 
 ## License
 
-Add a `LICENSE` file if you open-source this repo; until then, default copyright applies to your work.
+[MIT](LICENSE)
 
 ---
 

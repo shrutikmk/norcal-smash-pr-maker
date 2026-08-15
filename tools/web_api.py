@@ -934,6 +934,25 @@ def _oor_stats_empty(report: dict[str, Any]) -> bool:
     )
 
 
+def _oor_placements_incomplete(report: dict[str, Any]) -> bool:
+    """True when OOR activity exists but per-event placement rows are missing.
+
+    Older cache rows sometimes stored aggregate OOR W–L / notable lists without
+    ``out_region_placements``, which hid those events from the tournament list.
+    """
+    if report.get("out_region_placements"):
+        return False
+    return (
+        int(report.get("out_region_tournaments", 0) or 0) > 0
+        or int(report.get("out_region_wins", 0) or 0) > 0
+        or int(report.get("out_region_losses", 0) or 0) > 0
+        or bool(report.get("all_out_wins"))
+        or bool(report.get("all_out_losses"))
+        or bool(report.get("notable_out_wins"))
+        or bool(report.get("notable_out_losses"))
+    )
+
+
 def _oor_event_row_count(conn: sqlite3.Connection, ctx_hash: str, name: str) -> int:
     with _oor_cache_lock:
         row = conn.execute(
@@ -1131,21 +1150,36 @@ def _refresh_in_region_stats(
                 "event_id": str(s.get("event_id") or ""),
                 "wins": 0,
                 "losses": 0,
+                "start_at": None,
             }
         rec = seen_events[slug]
         if won:
             rec["wins"] += 1
         else:
             rec["losses"] += 1
+        st = s.get("start_at")
+        try:
+            st_i = int(st) if st is not None else None
+        except (TypeError, ValueError):
+            st_i = None
+        if st_i is not None and (rec["start_at"] is None or st_i < rec["start_at"]):
+            rec["start_at"] = st_i
 
     old_placements = {
-        str(p.get("event_slug", "")): p.get("placement")
+        str(p.get("event_slug", "")): p
         for p in (report.get("in_region_placements") or [])
     }
-    in_region_placements = [
-        {**rec, "placement": old_placements.get(slug)}
-        for slug, rec in seen_events.items()
-    ]
+    in_region_placements = []
+    for slug, rec in seen_events.items():
+        old = old_placements.get(slug) or {}
+        start_at = rec.get("start_at")
+        if start_at is None:
+            start_at = old.get("start_at")
+        in_region_placements.append({
+            **rec,
+            "placement": old.get("placement"),
+            "start_at": start_at,
+        })
     if cache_conn is not None:
         pid = player_id if player_id is not None else _player_id_for_name(name)
         in_region_placements = _apply_standings_cache_to_placements(
@@ -1955,8 +1989,28 @@ def _load_cached_reports_only(
     except Exception:
         cache_conn = None
 
+    def _try_rebuild_oor_placements(p: str, refreshed: dict[str, Any]) -> dict[str, Any]:
+        """Fill missing out_region_placements from granular oor_event_row cache."""
+        if cache_conn is None or not _oor_placements_incomplete(refreshed):
+            return refreshed
+        try:
+            row_count = _oor_event_row_count(cache_conn, ctx_hash, p)
+            if row_count <= 0:
+                return refreshed
+            rebuilt = _oor_rebuild_report_from_rows(cache_conn, ctx_hash, p, sets)
+            if not rebuilt.get("out_region_placements"):
+                return refreshed
+            _oor_stat("report_rebuilds")
+            return _refresh_in_region_stats(rebuilt, p, sets, cache_conn=cache_conn)
+        except Exception:
+            return refreshed
+
     def _accept_cached_report(p: str, refreshed: dict[str, Any]) -> bool:
+        refreshed = _try_rebuild_oor_placements(p, refreshed)
         if _in_region_placements_incomplete(refreshed, p, sets):
+            return False
+        # Still incomplete after rebuild → treat as miss so OOR can re-stream.
+        if _oor_placements_incomplete(refreshed):
             return False
         reports[p] = refreshed
         return True
@@ -1979,10 +2033,10 @@ def _load_cached_reports_only(
             cached = None
         if cached is not None:
             refreshed = _refresh_in_region_stats(cached, p, sets, cache_conn=cache_conn)
-            if not _oor_stats_empty(refreshed):
+            if not _oor_stats_empty(refreshed) or refreshed.get("out_region_placements"):
                 _oor_stat("report_sqlite_hits")
-                _mem_report_put(ctx_hash, p, refreshed)
                 if _accept_cached_report(p, refreshed):
+                    _mem_report_put(ctx_hash, p, reports[p])
                     continue
                 missing.append(p)
                 continue
@@ -3133,6 +3187,127 @@ def _date_range_worker(job_id: str, *, start: str, end: str, force_refresh: bool
         _warm_pause_end()
 
 
+_TOURNAMENT_ICON_DB_PATH = PROJECT_ROOT / "data" / "tournament_icons.db"
+_TOURNAMENT_ICON_LOCK = Lock()
+_TOURNAMENT_ICON_FETCH_CAP = 12
+_tournament_icon_schema_ready = False
+
+
+def _tournament_icon_conn() -> sqlite3.Connection:
+    global _tournament_icon_schema_ready
+    _TOURNAMENT_ICON_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(_TOURNAMENT_ICON_DB_PATH), timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.DatabaseError:
+        pass
+    if not _tournament_icon_schema_ready:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tournament_icons (
+                slug TEXT PRIMARY KEY,
+                icon_url TEXT,
+                fetched_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        _tournament_icon_schema_ready = True
+    return conn
+
+
+def _normalize_tournament_icon_slugs(raw_slugs: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in raw_slugs:
+        slug = recent_events_tool.tournament_slug_from_event_slug(str(raw or ""))
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        out.append(slug)
+    return out
+
+
+def _cached_tournament_icons(slugs: list[str]) -> dict[str, str | None]:
+    if not slugs:
+        return {}
+    with _TOURNAMENT_ICON_LOCK:
+        conn = _tournament_icon_conn()
+        try:
+            placeholders = ",".join("?" for _ in slugs)
+            rows = conn.execute(
+                f"SELECT slug, icon_url FROM tournament_icons WHERE slug IN ({placeholders})",
+                slugs,
+            ).fetchall()
+        finally:
+            conn.close()
+    return {str(slug): (str(url) if url else None) for slug, url in rows}
+
+
+def _store_tournament_icon(slug: str, icon_url: str | None) -> None:
+    with _TOURNAMENT_ICON_LOCK:
+        conn = _tournament_icon_conn()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tournament_icons (slug, icon_url, fetched_at)
+                VALUES (?, ?, ?)
+                """,
+                (slug, icon_url, int(_time.time())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _fetch_and_cache_tournament_icon(slug: str) -> str | None:
+    token = os.environ.get("STARTGG_API_KEY", "").strip()
+    if not token:
+        return None
+    client = recent_events_tool.StartGGClient(token)
+    details = recent_events_tool._fetch_tournament_details(client, slug)
+    icon_url = None
+    if details:
+        icon_url = recent_events_tool._pick_tournament_image(details.get("images") or [])
+    _store_tournament_icon(slug, icon_url)
+    return icon_url
+
+
+def _resolve_tournament_icons(raw_slugs: list[Any], *, fetch_missing: bool) -> dict[str, Any]:
+    slugs = _normalize_tournament_icon_slugs(raw_slugs)
+    icons = _cached_tournament_icons(slugs)
+    pending = [slug for slug in slugs if slug not in icons]
+    if fetch_missing:
+        for slug in pending[:_TOURNAMENT_ICON_FETCH_CAP]:
+            try:
+                icons[slug] = _fetch_and_cache_tournament_icon(slug)
+            except Exception:
+                continue
+        pending = [slug for slug in slugs if slug not in icons]
+    return {"icons": icons, "pending": pending}
+
+
+def _attach_cached_tournament_icons(expanded: dict[str, Any] | None) -> None:
+    if not expanded:
+        return
+    rows = expanded.get("tournamentsAttended")
+    if not isinstance(rows, list) or not rows:
+        return
+    slugs = _normalize_tournament_icon_slugs(
+        [row.get("eventSlug") for row in rows if isinstance(row, dict)]
+    )
+    cached = _cached_tournament_icons(slugs)
+    if not cached:
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        slug = recent_events_tool.tournament_slug_from_event_slug(str(row.get("eventSlug") or ""))
+        if slug in cached:
+            row["iconUrl"] = cached[slug]
+
+
 def _sanitize_for_json(obj: Any) -> Any:
     """Replace NaN/Inf floats with None so output is RFC 8259 JSON (browser JSON.parse safe)."""
     if isinstance(obj, float):
@@ -3491,12 +3666,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 expanded = _expanded_head_to_head(
                     player_a, player_b, sets, reports, elo=elo,
                 )
+                _attach_cached_tournament_icons(expanded)
                 self._write_json(200, {
                     "card": card,
                     "expanded": expanded,
                     "hasOOR": bool(include_oor) and not missing_oor,
                     "missingOOR": missing_oor,
                 })
+                return
+
+            if parsed.path == "/api/tournament-icons":
+                _ensure_runtime_deps()
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length > 0 else b"{}"
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except json.JSONDecodeError as jexc:
+                    self._write_json(400, {"error": f"Invalid JSON: {jexc}"})
+                    return
+                slugs = body.get("slugs")
+                if not isinstance(slugs, list):
+                    self._write_json(400, {"error": "slugs must be a list"})
+                    return
+                self._write_json(200, _resolve_tournament_icons(slugs, fetch_missing=True))
                 return
 
             if parsed.path == "/api/pr-maker/comparison/argument":

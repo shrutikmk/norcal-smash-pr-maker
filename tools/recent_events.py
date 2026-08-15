@@ -338,6 +338,20 @@ def _pick_tournament_image(images: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def tournament_slug_from_event_slug(event_slug: str) -> str:
+    """Normalize an event or tournament slug to start.gg's tournament slug.
+
+    ``tournament/go-elsewhere-1/event/ultimate-singles`` → ``tournament/go-elsewhere-1``
+    """
+    s = str(event_slug or "").strip().strip("/")
+    if not s:
+        return ""
+    parts = s.split("/")
+    if parts[0] == "tournament" and len(parts) >= 2 and parts[1]:
+        return f"tournament/{parts[1]}"
+    return s
+
+
 def _fetch_recent_tournament_stubs(client: StartGGClient, config: RecentEventsConfig) -> list[dict[str, Any]]:
     """
     Fetch the most recent concluded tournaments with minimal API calls.

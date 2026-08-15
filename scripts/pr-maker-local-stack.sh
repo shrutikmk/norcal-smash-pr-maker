@@ -5,41 +5,96 @@
 # up, and binds the PR Maker API on :8775 (scheduler web UI uses :8765).
 #
 # Usage:
-#   ./scripts/pr-maker-local-stack.sh start
+#   ./scripts/pr-maker-local-stack.sh start    # background; logs under scripts/.pr-maker-stack/logs/
 #   ./scripts/pr-maker-local-stack.sh stop
-#   ./scripts/pr-maker-local-stack.sh restart
+#   ./scripts/pr-maker-local-stack.sh restart  # stop then start (full cycle)
 #   ./scripts/pr-maker-local-stack.sh status
-#   ./scripts/pr-maker-local-stack.sh logs
-#   ./scripts/pr-maker-local-stack.sh run
+#   ./scripts/pr-maker-local-stack.sh logs     # tail -f all logs (Ctrl+C stops tail only)
+#   ./scripts/pr-maker-local-stack.sh run      # start + foreground log tail; Ctrl+C stops the stack
 #
 # Env:
 #   PR_MAKER_SKIP_VLLM=1       — never start vLLM (requires VLLM_14B_BASE_URL or probe on PR_MAKER_VLLM_PORT)
 #   PR_MAKER_SKIP_WEB=1        — API + vLLM only (run Vite manually)
 #   PR_MAKER_VLLM_PORT=8000
-#   PR_MAKER_VLLM_MODEL        — default ~/models/gemma-4-26B-A4B
-#   PR_MAKER_VLLM_SERVED_NAME  — default gemma-4-26B-A4B
+#   PR_MAKER_VLLM_MODEL        — default ~/models/gemma-4-26B-A4B-it if present, else ~/models/gemma-4-26B-A4B
+#   PR_MAKER_VLLM_SERVED_NAME  — default matches the model folder name
 #   PR_MAKER_VLLM_EXTRA_ARGS    — default --reasoning-parser gemma4
 #   PR_MAKER_API_PORT=8775     — default 8775 (not 8765; scheduler uses that)
 #   PR_MAKER_WEB_PORT=5173
 #   PR_MAKER_VLLM_WAIT_SEC=600
 #   PR_MAKER_API_WAIT_SEC=60
+#   PR_MAKER_WEB_WAIT_SEC=120
+#   PR_MAKER_PYTHON            — override the API interpreter (default: $ROOT/.venv/bin/python)
+#   PR_MAKER_VENV / LOCAL_STACK_VENV — venv activated for start/restart/run
+#                                 (default: ~/.venv-vllm-metal so `vllm` is on PATH;
+#                                 API still uses $ROOT/.venv)
+#
+# Binds to 127.0.0.1. No Docker. State under scripts/.pr-maker-stack/ (gitignored).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATEDIR="$ROOT/scripts/.pr-maker-stack"
 PIDFILE="$STATEDIR/pids"
 LOGDIR="$STATEDIR/logs"
+WEB_DIR="$ROOT/web"
 
 export HF_HOME="${HF_HOME:-$HOME/models/.hf-cache}"
 
+# Activate the stack runtime venv when not already active (self-contained start).
+# vLLM lives in ~/.venv-vllm-metal; the API interpreter is still $ROOT/.venv.
+ensure_stack_venv() {
+  local venv="${PR_MAKER_VENV:-${LOCAL_STACK_VENV:-}}"
+  if [[ -z "$venv" ]]; then
+    if [[ -d "$HOME/.venv-vllm-metal" ]]; then
+      venv="$HOME/.venv-vllm-metal"
+    elif [[ -d "$ROOT/.venv" ]]; then
+      venv="$ROOT/.venv"
+    else
+      echo "error: no venv found. Create $ROOT/.venv or set PR_MAKER_VENV / LOCAL_STACK_VENV." >&2
+      echo "  python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
+      exit 1
+    fi
+  fi
+  local want activate have
+  want="$(cd "$venv" 2>/dev/null && pwd)" || {
+    echo "error: venv not found: $venv (set PR_MAKER_VENV or LOCAL_STACK_VENV)" >&2
+    exit 1
+  }
+  activate="$want/bin/activate"
+  if [[ ! -f "$activate" ]]; then
+    echo "error: missing $activate" >&2
+    exit 1
+  fi
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    have="$(cd "$VIRTUAL_ENV" 2>/dev/null && pwd)" || have=""
+    if [[ "$have" == "$want" ]]; then
+      return 0
+    fi
+  fi
+  echo "Activating venv: $want"
+  # shellcheck disable=SC1090
+  source "$activate"
+}
+
 VLLM_PORT="${PR_MAKER_VLLM_PORT:-8000}"
-VLLM_MODEL="${PR_MAKER_VLLM_MODEL:-$HOME/models/gemma-4-26B-A4B}"
-VLLM_SERVED_NAME="${PR_MAKER_VLLM_SERVED_NAME:-gemma-4-26B-A4B}"
+if [[ -z "${PR_MAKER_VLLM_MODEL:-}" ]]; then
+  if [[ -d "$HOME/models/gemma-4-26B-A4B-it" ]]; then
+    VLLM_MODEL="$HOME/models/gemma-4-26B-A4B-it"
+    VLLM_SERVED_NAME="${PR_MAKER_VLLM_SERVED_NAME:-gemma-4-26B-A4B-it}"
+  else
+    VLLM_MODEL="$HOME/models/gemma-4-26B-A4B"
+    VLLM_SERVED_NAME="${PR_MAKER_VLLM_SERVED_NAME:-gemma-4-26B-A4B}"
+  fi
+else
+  VLLM_MODEL="$PR_MAKER_VLLM_MODEL"
+  VLLM_SERVED_NAME="${PR_MAKER_VLLM_SERVED_NAME:-$(basename "$VLLM_MODEL")}"
+fi
 VLLM_EXTRA_ARGS="${PR_MAKER_VLLM_EXTRA_ARGS:---reasoning-parser gemma4}"
 API_PORT="${PR_MAKER_API_PORT:-8775}"
 WEB_PORT="${PR_MAKER_WEB_PORT:-5173}"
 VLLM_WAIT_SEC="${PR_MAKER_VLLM_WAIT_SEC:-600}"
 API_WAIT_SEC="${PR_MAKER_API_WAIT_SEC:-60}"
+WEB_WAIT_SEC="${PR_MAKER_WEB_WAIT_SEC:-120}"
 
 API_HOST="127.0.0.1"
 VLLM_REUSED=0
@@ -54,6 +109,28 @@ python_bin() {
   else
     echo "python3"
   fi
+}
+
+free_port() {
+  local port=$1
+  local pids
+  pids="$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    echo "Freeing port $port (pids: $pids)"
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    sleep 0.5
+    pids="$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null || true
+    fi
+  fi
+}
+
+had_vllm_in_pidfile() {
+  [[ -f "$PIDFILE" ]] || return 1
+  grep -q '^vllm ' "$PIDFILE"
 }
 
 wait_http() {
@@ -139,11 +216,13 @@ start_vllm_if_needed() {
 
   if ! command -v vllm >/dev/null 2>&1; then
     echo "error: vllm not on PATH and nothing is listening on port ${VLLM_PORT}." >&2
-    echo "  Start the scheduler stack or vLLM manually, or install vLLM Metal." >&2
+    echo "  Start the scheduler stack, or install vLLM Metal in ~/.venv-vllm-metal." >&2
+    echo "  Or set PR_MAKER_SKIP_VLLM=1 if you only need the API + UI." >&2
     exit 1
   fi
 
   echo "Starting vLLM on port $VLLM_PORT (log: $LOGDIR/vllm.log) ..."
+  touch "$LOGDIR/vllm.log"
   # shellcheck disable=SC2086
   nohup vllm serve "$VLLM_MODEL" --port "$VLLM_PORT" --served-model-name "$VLLM_SERVED_NAME" \
     $VLLM_EXTRA_ARGS \
@@ -202,6 +281,26 @@ stop_pidfile_processes() {
   rm -f "$PIDFILE"
 }
 
+print_ready_banner() {
+  echo ""
+  echo "Stack started."
+  if [[ "${PR_MAKER_SKIP_WEB:-0}" != "1" ]]; then
+    echo "  Web UI:    http://127.0.0.1:${WEB_PORT}/"
+  fi
+  echo "  API:       http://${API_HOST}:${API_PORT}/"
+  if [[ "$VLLM_REUSED" -eq 1 ]]; then
+    echo "  vLLM:      ${VLLM_14B_BASE_URL} (reused — shared with scheduler or another stack)"
+  else
+    echo "  vLLM:      ${VLLM_14B_BASE_URL}"
+  fi
+  echo "  Logs:      $LOGDIR"
+  echo "  Stop:      $0 stop"
+  echo "  Restart:   $0 restart"
+  if [[ -z "${PR_MAKER_STACK_FOREGROUND:-}" ]]; then
+    echo "  Tail logs: $0 logs"
+  fi
+}
+
 cmd_status() {
   if [[ ! -f "$PIDFILE" ]]; then
     echo "No pidfile at $PIDFILE (stack not started via this script)."
@@ -212,6 +311,7 @@ cmd_status() {
   fi
   local ok=0
   while read -r name pid; do
+    [[ -z "${pid:-}" ]] && continue
     if kill -0 "$pid" 2>/dev/null; then
       echo "$name pid $pid: running"
     else
@@ -226,8 +326,19 @@ cmd_status() {
 }
 
 cmd_stop() {
+  local had_vllm=0
+  if had_vllm_in_pidfile; then
+    had_vllm=1
+  fi
   stop_pidfile_processes
-  echo "Stop complete (only PR Maker pidfile processes were stopped; shared vLLM left running)."
+  free_port "$API_PORT"
+  if [[ "${PR_MAKER_SKIP_WEB:-0}" != "1" ]]; then
+    free_port "$WEB_PORT"
+  fi
+  if [[ "$had_vllm" -eq 1 ]]; then
+    free_port "$VLLM_PORT"
+  fi
+  echo "Stop complete (shared vLLM left running unless this script started it)."
 }
 
 cmd_restart() {
@@ -238,6 +349,10 @@ cmd_restart() {
 
 cleanup_run() {
   stop_pidfile_processes
+  free_port "$API_PORT"
+  if [[ "${PR_MAKER_SKIP_WEB:-0}" != "1" ]]; then
+    free_port "$WEB_PORT"
+  fi
   if [[ -n "${tail_pid:-}" ]]; then
     kill -TERM "$tail_pid" 2>/dev/null || true
   fi
@@ -284,7 +399,7 @@ cmd_start() {
   if [[ -f "$PIDFILE" ]]; then
     any_alive=0
     while read -r name pid; do
-      [[ -z "$pid" ]] && continue
+      [[ -z "${pid:-}" ]] && continue
       if kill -0 "$pid" 2>/dev/null; then
         any_alive=1
         break
@@ -296,6 +411,11 @@ cmd_start() {
     fi
   fi
   rm -f "$PIDFILE"
+
+  if [[ ! -x "$(python_bin)" ]]; then
+    echo "error: API python not found ($(python_bin)). Create $ROOT/.venv and pip install -r requirements.txt" >&2
+    exit 1
+  fi
 
   vllm_pid=""
   api_pid=""
@@ -350,16 +470,20 @@ cmd_start() {
       cmd_stop || true
       exit 1
     fi
+    if [[ ! -d "$WEB_DIR/node_modules" ]]; then
+      echo "Installing web dependencies ..."
+      (cd "$WEB_DIR" && npm install)
+    fi
     echo "Starting Vite on port $WEB_PORT (log: $LOGDIR/web.log) ..."
     nohup env PR_MAKER_API_PORT="$API_PORT" VITE_API_PORT="$API_PORT" \
-      npm --prefix "$ROOT/web" run dev -- --host 127.0.0.1 --port "$WEB_PORT" \
+      npm --prefix "$WEB_DIR" run dev -- --host 127.0.0.1 --port "$WEB_PORT" \
       >>"$LOGDIR/web.log" 2>&1 &
     web_pid=$!
     echo "web $web_pid" >>"$PIDFILE"
     wait_http \
       "http://127.0.0.1:${WEB_PORT}/" \
-      "Vite is up." \
-      120 \
+      "Vite is up — http://127.0.0.1:${WEB_PORT}/ is browsable now." \
+      "$WEB_WAIT_SEC" \
       "Vite dev server on port ${WEB_PORT}" \
       "$web_pid" || {
       echo "Web log tail ($LOGDIR/web.log):" >&2
@@ -369,23 +493,7 @@ cmd_start() {
     }
   fi
 
-  echo ""
-  echo "Stack started."
-  if [[ "${PR_MAKER_SKIP_WEB:-0}" != "1" ]]; then
-    echo "  Web UI:  http://127.0.0.1:${WEB_PORT}/"
-  fi
-  echo "  API:     http://${API_HOST}:${API_PORT}/"
-  if [[ "$VLLM_REUSED" -eq 1 ]]; then
-    echo "  vLLM:    ${VLLM_14B_BASE_URL} (reused — shared with scheduler or another stack)"
-  else
-    echo "  vLLM:    ${VLLM_14B_BASE_URL}"
-  fi
-  echo "  Logs:    $LOGDIR"
-  echo "  Stop:    $0 stop"
-  echo "  Restart: $0 restart"
-  if [[ -z "${PR_MAKER_STACK_FOREGROUND:-}" ]]; then
-    echo "  Tail logs: $0 logs"
-  fi
+  print_ready_banner
 }
 
 cmd_logs() {
@@ -411,11 +519,16 @@ cmd_logs() {
 }
 
 usage() {
-  sed -n '2,24p' "$0" | sed 's/^# *//'
+  sed -n '2,32p' "$0" | sed 's/^# *//'
 }
 
 main() {
   local sub=${1:-}
+  case "$sub" in
+    start | restart | run)
+      ensure_stack_venv
+      ;;
+  esac
   case "$sub" in
     start) cmd_start ;;
     stop) cmd_stop ;;

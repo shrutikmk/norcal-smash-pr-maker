@@ -711,6 +711,24 @@ def _h2h_record(h2h: dict[tuple[str, str], tuple[int, int]], p1: str, p2: str) -
     return (w1, w2) if p1 < p2 else (w2, w1)
 
 
+def _oor_opponent_records(report: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Per-opponent W–L built only from out-of-region set result name lists."""
+    records: dict[str, dict[str, int]] = {}
+    for opp in report.get("all_out_wins", []) or []:
+        name = str(opp)
+        if not name:
+            continue
+        rec = records.setdefault(name, {"wins": 0, "losses": 0})
+        rec["wins"] += 1
+    for opp in report.get("all_out_losses", []) or []:
+        name = str(opp)
+        if not name:
+            continue
+        rec = records.setdefault(name, {"wins": 0, "losses": 0})
+        rec["losses"] += 1
+    return records
+
+
 def _build_player_opponent_records(
     player: str,
     in_region_sets: list[dict[str, Any]],
@@ -739,21 +757,121 @@ def _build_player_opponent_records(
 
 
 def _bracket_placement_index(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Index placement rows by event_slug (one bracket per key)."""
+    """Index placement rows by event_slug (one bracket per key).
+
+    Includes both in-region and out-of-region placements. Prefer in-region when
+    the same slug appears in both (should be rare).
+    """
     out: dict[str, dict[str, Any]] = {}
-    rows = (report.get("in_region_placements", []) or []) + (report.get("out_region_placements", []) or [])
-    for row in rows:
-        slug = str(row.get("event_slug") or "")
+
+    def _ingest(rows: list[dict[str, Any]], region: str, *, overwrite: bool) -> None:
+        for row in rows:
+            slug = str(row.get("event_slug") or "")
+            if not slug:
+                continue
+            if slug in out and not overwrite:
+                continue
+            start_at = row.get("start_at")
+            try:
+                start_at_i = int(start_at) if start_at is not None else None
+            except (TypeError, ValueError):
+                start_at_i = None
+            out[slug] = {
+                "tournament_name": str(row.get("tournament_name") or ""),
+                "tournament_id": str(row.get("tournament_id") or ""),
+                "event_slug": slug,
+                "placement": row.get("placement"),
+                "wins": int(row.get("wins") or 0),
+                "losses": int(row.get("losses") or 0),
+                "start_at": start_at_i,
+                "region": region,
+                "notable_wins": [str(x) for x in (row.get("notable_wins") or [])],
+                "notable_losses": [str(x) for x in (row.get("notable_losses") or [])],
+            }
+
+    _ingest(list(report.get("out_region_placements") or []), "out", overwrite=True)
+    _ingest(list(report.get("in_region_placements") or []), "in", overwrite=True)
+    return out
+
+
+def _player_sets_by_event_slug(
+    player: str,
+    in_region_sets: list[dict[str, Any]],
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """Group a player's in-region sets by event_slug; also return earliest start_at per slug."""
+    by_slug: dict[str, list[dict[str, Any]]] = {}
+    start_by_slug: dict[str, int] = {}
+    for s in in_region_sets:
+        if s.get("p1") != player and s.get("p2") != player:
+            continue
+        slug = str(s.get("event_slug") or "")
         if not slug:
             continue
-        out[slug] = {
-            "tournament_name": str(row.get("tournament_name") or ""),
-            "event_slug": slug,
-            "placement": row.get("placement"),
-            "wins": int(row.get("wins") or 0),
-            "losses": int(row.get("losses") or 0),
-        }
+        if s.get("p1") == player:
+            opponent = str(s.get("p2") or "")
+            player_score = int(s.get("p1_score") or 0)
+            opponent_score = int(s.get("p2_score") or 0)
+        else:
+            opponent = str(s.get("p1") or "")
+            player_score = int(s.get("p2_score") or 0)
+            opponent_score = int(s.get("p1_score") or 0)
+        by_slug.setdefault(slug, []).append({
+            "opponent": opponent,
+            "playerScore": player_score,
+            "opponentScore": opponent_score,
+            "won": player_score > opponent_score,
+            "setId": str(s.get("set_id") or ""),
+        })
+        st = s.get("start_at")
+        try:
+            st_i = int(st) if st is not None else None
+        except (TypeError, ValueError):
+            st_i = None
+        if st_i is not None:
+            prev = start_by_slug.get(slug)
+            if prev is None or st_i < prev:
+                start_by_slug[slug] = st_i
+    return by_slug, start_by_slug
+
+
+def _sets_from_notable(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """OOR fallback run: opponent names only (no scores)."""
+    out: list[dict[str, Any]] = []
+    for opp in entry.get("notable_wins") or []:
+        out.append({
+            "opponent": str(opp),
+            "playerScore": None,
+            "opponentScore": None,
+            "won": True,
+            "setId": "",
+        })
+    for opp in entry.get("notable_losses") or []:
+        out.append({
+            "opponent": str(opp),
+            "playerScore": None,
+            "opponentScore": None,
+            "won": False,
+            "setId": "",
+        })
     return out
+
+
+def _tournament_player_side(
+    entry: dict[str, Any] | None,
+    scored_sets: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    sets = list(scored_sets or [])
+    if not sets:
+        sets = _sets_from_notable(entry)
+    return {
+        "place": entry.get("placement"),
+        "wins": int(entry.get("wins") or 0),
+        "losses": int(entry.get("losses") or 0),
+        "region": entry.get("region") or "in",
+        "sets": sets,
+    }
 
 
 def _bracket_display_name(tournament_name: str, event_slug: str) -> tuple[str, str]:
@@ -840,28 +958,64 @@ def _expanded_head_to_head(
 
     b1 = _bracket_placement_index(r1)
     b2 = _bracket_placement_index(r2)
-    shared_bracket_slugs = sorted(
-        set(b1.keys()) & set(b2.keys()),
-        key=lambda slug: (
-            str(b1[slug].get("tournament_name") or b2[slug].get("tournament_name") or ""),
-            slug,
+    p1_sets_by_slug, p1_start_by_slug = _player_sets_by_event_slug(p1, in_region_sets)
+    p2_sets_by_slug, p2_start_by_slug = _player_sets_by_event_slug(p2, in_region_sets)
+
+    union_slugs = set(b1.keys()) | set(b2.keys())
+
+    def _slug_start(slug: str) -> int:
+        for src in (
+            b1.get(slug, {}).get("start_at"),
+            b2.get(slug, {}).get("start_at"),
+            p1_start_by_slug.get(slug),
+            p2_start_by_slug.get(slug),
+        ):
+            if isinstance(src, int):
+                return src
+        return 0
+
+    tournaments_attended: list[dict[str, Any]] = []
+    for slug in sorted(
+        union_slugs,
+        key=lambda s: (
+            -_slug_start(s),
+            str((b1.get(s) or b2.get(s) or {}).get("tournament_name") or ""),
+            s,
         ),
-    )
-    tournaments_both = []
-    for slug in shared_bracket_slugs:
-        a, b = b1[slug], b2[slug]
+    ):
+        a = b1.get(slug)
+        b = b2.get(slug)
         tname, bracket = _bracket_display_name(
-            str(a.get("tournament_name") or b.get("tournament_name") or ""),
+            str((a or b or {}).get("tournament_name") or ""),
             slug,
         )
-        tournaments_both.append({
+        p1_side = _tournament_player_side(a, p1_sets_by_slug.get(slug))
+        p2_side = _tournament_player_side(b, p2_sets_by_slug.get(slug))
+        tournaments_attended.append({
             "name": tname,
             "bracket": bracket,
             "eventSlug": slug,
-            "p1Place": a.get("placement"),
-            "p1WL": f"{a.get('wins', 0)}-{a.get('losses', 0)}",
-            "p2Place": b.get("placement"),
-            "p2WL": f"{b.get('wins', 0)}-{b.get('losses', 0)}",
+            "tournamentId": str((a or b or {}).get("tournament_id") or ""),
+            "startAt": _slug_start(slug) or None,
+            "shared": a is not None and b is not None,
+            "p1": p1_side,
+            "p2": p2_side,
+        })
+
+    # Legacy shared-only list (kept for older clients / tests).
+    tournaments_both = []
+    for t in tournaments_attended:
+        if not t["shared"]:
+            continue
+        a, b = t["p1"], t["p2"]
+        tournaments_both.append({
+            "name": t["name"],
+            "bracket": t["bracket"],
+            "eventSlug": t["eventSlug"],
+            "p1Place": a.get("place") if a else None,
+            "p1WL": f"{a.get('wins', 0)}-{a.get('losses', 0)}" if a else "0-0",
+            "p2Place": b.get("place") if b else None,
+            "p2WL": f"{b.get('wins', 0)}-{b.get('losses', 0)}" if b else "0-0",
         })
 
     p1_unique_wins = sorted(
@@ -873,10 +1027,84 @@ def _expanded_head_to_head(
         key=lambda o: _opp_elo(o), reverse=True,
     )
 
+    def _record_row(o: str) -> dict[str, Any]:
+        r1o = rec1.get(o)
+        r2o = rec2.get(o)
+        p1_played = r1o is not None and (r1o["wins"] > 0 or r1o["losses"] > 0)
+        p2_played = r2o is not None and (r2o["wins"] > 0 or r2o["losses"] > 0)
+        return {
+            "opponent": o,
+            "p1Wins": r1o["wins"] if p1_played else None,
+            "p1Losses": r1o["losses"] if p1_played else None,
+            "p2Wins": r2o["wins"] if p2_played else None,
+            "p2Losses": r2o["losses"] if p2_played else None,
+            "oppElo": round(_opp_elo(o), 2),
+        }
+
+    # Unified "Has Beaten" / "Has Lost To" tables, sorted by Opp ELO.
+    has_beaten_names = sorted(
+        {
+            opp for opp in set(rec1) | set(rec2)
+            if rec1.get(opp, {}).get("wins", 0) > 0 or rec2.get(opp, {}).get("wins", 0) > 0
+        },
+        key=lambda o: _opp_elo(o),
+        reverse=True,
+    )
+    has_lost_to_names = sorted(
+        {
+            opp for opp in set(rec1) | set(rec2)
+            if rec1.get(opp, {}).get("losses", 0) > 0 or rec2.get(opp, {}).get("losses", 0) > 0
+        },
+        key=lambda o: _opp_elo(o),
+        reverse=True,
+    )
+    has_beaten = [_record_row(o) for o in has_beaten_names]
+    has_lost_to = [_record_row(o) for o in has_lost_to_names]
+
+    # OOR-only Has Beaten / Has Lost To (from all_out_wins / all_out_losses).
+    oor1 = _oor_opponent_records(r1)
+    oor2 = _oor_opponent_records(r2)
+
+    def _oor_record_row(o: str) -> dict[str, Any]:
+        r1o = oor1.get(o)
+        r2o = oor2.get(o)
+        p1_played = r1o is not None and (r1o["wins"] > 0 or r1o["losses"] > 0)
+        p2_played = r2o is not None and (r2o["wins"] > 0 or r2o["losses"] > 0)
+        return {
+            "opponent": o,
+            "p1Wins": r1o["wins"] if p1_played else None,
+            "p1Losses": r1o["losses"] if p1_played else None,
+            "p2Wins": r2o["wins"] if p2_played else None,
+            "p2Losses": r2o["losses"] if p2_played else None,
+            "oppElo": round(_opp_elo(o), 2),
+        }
+
+    has_beaten_oor_names = sorted(
+        {
+            opp for opp in set(oor1) | set(oor2)
+            if oor1.get(opp, {}).get("wins", 0) > 0 or oor2.get(opp, {}).get("wins", 0) > 0
+        },
+        key=lambda o: _opp_elo(o),
+        reverse=True,
+    )
+    has_lost_to_oor_names = sorted(
+        {
+            opp for opp in set(oor1) | set(oor2)
+            if oor1.get(opp, {}).get("losses", 0) > 0 or oor2.get(opp, {}).get("losses", 0) > 0
+        },
+        key=lambda o: _opp_elo(o),
+        reverse=True,
+    )
+
     return {
         "sharedWins": shared_wins,
         "sharedLosses": shared_losses,
         "tournamentsBothAttended": tournaments_both,
+        "tournamentsAttended": tournaments_attended,
+        "hasBeaten": has_beaten,
+        "hasLostTo": has_lost_to,
+        "hasBeatenOOR": [_oor_record_row(o) for o in has_beaten_oor_names],
+        "hasLostToOOR": [_oor_record_row(o) for o in has_lost_to_oor_names],
         "p1UniqueWins": [{"opponent": o, "wins": rec1[o]["wins"], "losses": rec1[o]["losses"],
                           "oppElo": round(_opp_elo(o), 2)} for o in p1_unique_wins[:20]],
         "p2UniqueWins": [{"opponent": o, "wins": rec2[o]["wins"], "losses": rec2[o]["losses"],

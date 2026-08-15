@@ -6,6 +6,9 @@ import RankingListPanel from '../components/RankingListPanel.jsx'
 // Module-level comparison cache: revisiting a pair (back nav, restart, refresh
 // within the SPA session) renders instantly instead of refetching + restreaming.
 // Keyed by context fingerprint + sorted pair + whether OOR was included.
+// Bump COMPARISON_CACHE_VERSION when expanded payload shape changes so stale
+// entries (e.g. missing tournamentsAttended) are not reused.
+const COMPARISON_CACHE_VERSION = 3
 const comparisonCache = new Map()
 const COMPARISON_CACHE_MAX = 300
 
@@ -16,7 +19,12 @@ function comparisonCacheKey(ctx, pA, pB, withOor) {
     [...(ctx.eventSlugs || [])].sort(),
     ctx.mergeRules || [],
   ])
-  return `${ctxFp}|${pair}|oor:${withOor ? 1 : 0}`
+  return `v${COMPARISON_CACHE_VERSION}|${ctxFp}|${pair}|oor:${withOor ? 1 : 0}`
+}
+
+/** True when cached/API expanded has the union tournament list (not legacy shared-only). */
+function hasTournamentsAttendedPayload(expanded) {
+  return Array.isArray(expanded?.tournamentsAttended)
 }
 
 function comparisonCachePut(key, value) {
@@ -434,13 +442,18 @@ export default function PRMakerRankingPage() {
     // Full cache hit (incl. OOR): render instantly, no network at all.
     const oorKey = comparisonCacheKey(ctx, pA, pB, true)
     const cachedFull = comparisonCache.get(oorKey)
-    if (cachedFull) {
+    if (cachedFull && hasTournamentsAttendedPayload(cachedFull.expanded)) {
       dlog('info', 'PRMaker/Ranking', `Comparison cache hit (with OOR) for ${pA} vs ${pB} — no fetch`)
       setCard(cachedFull.card || null)
       setExpanded(cachedFull.expanded || null)
       setLoading(false)
       setLoadPhase('')
       return
+    }
+    if (cachedFull) {
+      // Stale shape from before tournamentsAttended — drop and refetch.
+      comparisonCache.delete(oorKey)
+      dlog('info', 'PRMaker/Ranking', `Ignoring stale comparison cache for ${pA} vs ${pB} (missing tournamentsAttended)`)
     }
 
     try {
@@ -462,7 +475,9 @@ export default function PRMakerRankingPage() {
 
       if (res.ok && missing.length === 0) {
         dlog('info', 'PRMaker/Ranking', `Comparison loaded with full OOR from server cache (1 round trip) for ${pA} vs ${pB}`)
-        comparisonCachePut(oorKey, { card: data.card, expanded: data.expanded })
+        if (hasTournamentsAttendedPayload(data.expanded)) {
+          comparisonCachePut(oorKey, { card: data.card, expanded: data.expanded })
+        }
         setLoadPhase('')
         return
       }
@@ -499,7 +514,11 @@ export default function PRMakerRankingPage() {
         const oorData = await oorRes.json()
         if (!ctrl.signal.aborted) {
           dlog('info', 'PRMaker/Ranking', `OOR comparison loaded for ${pA} vs ${pB}`)
-          if (oorRes.ok && (!oorData.missingOOR || oorData.missingOOR.length === 0)) {
+          if (
+            oorRes.ok
+            && (!oorData.missingOOR || oorData.missingOOR.length === 0)
+            && hasTournamentsAttendedPayload(oorData.expanded)
+          ) {
             comparisonCachePut(oorKey, { card: oorData.card, expanded: oorData.expanded })
           }
           setCard(oorData.card || null)
@@ -576,7 +595,7 @@ export default function PRMakerRankingPage() {
           .then((r) => r.json().then((d) => ({ ok: r.ok, d })))
           .then(({ ok, d }) => {
             const miss = ok && Array.isArray(d.missingOOR) ? d.missingOOR : []
-            if (ok && miss.length === 0) {
+            if (ok && miss.length === 0 && hasTournamentsAttendedPayload(d.expanded)) {
               comparisonCachePut(key, { card: d.card, expanded: d.expanded })
               dlog('info', 'PRMaker/Ranking', `Prefetched next pair ${npA} vs ${npB} (full cache)`)
             } else {
@@ -716,11 +735,13 @@ export default function PRMakerRankingPage() {
           <RankingListPanel ordered={ordered} />
 
           <div className="compare-done-actions">
-            <button type="button" className="compare-btn compare-btn-a" onClick={handleContinueToFinal}>
+            <button type="button" className="compare-done-btn compare-done-btn--primary" onClick={handleContinueToFinal}>
               Continue to final list
             </button>
-            <button type="button" className="compare-restart-btn" onClick={handleRestart}>Restart comparisons</button>
-            <Link to="/pr-maker/tiering" className="pr-maker-back-link">← Back to tiering</Link>
+            <button type="button" className="compare-done-btn compare-done-btn--secondary" onClick={handleRestart}>
+              Restart comparisons
+            </button>
+            <Link to="/pr-maker/tiering" className="compare-done-back">← Back to tiering</Link>
           </div>
         </div>
       </main>
@@ -888,6 +909,25 @@ const ComparisonBody = memo(function ComparisonBody({ card, expanded, pA, pB }) 
 
   const h2hA = h2h[pA] ?? 0
   const h2hB = h2h[pB] ?? 0
+  const hasBeaten = useMemo(() => resolveHasBeaten(expanded), [expanded])
+  const hasLostTo = useMemo(() => resolveHasLostTo(expanded), [expanded])
+  const hasBeatenOOR = useMemo(
+    () => resolveHasBeatenOOR(expanded, card, pA, pB),
+    [expanded, card, pA, pB],
+  )
+  const hasLostToOOR = useMemo(
+    () => resolveHasLostToOOR(expanded, card, pA, pB),
+    [expanded, card, pA, pB],
+  )
+  const tournaments = useMemo(() => resolveTournamentsAttended(expanded), [expanded])
+  const tourneyCountA = useMemo(
+    () => tournaments.filter((t) => t.p1).length,
+    [tournaments],
+  )
+  const tourneyCountB = useMemo(
+    () => tournaments.filter((t) => t.p2).length,
+    [tournaments],
+  )
 
   return (
     <div className="compare-body">
@@ -917,83 +957,29 @@ const ComparisonBody = memo(function ComparisonBody({ card, expanded, pA, pB }) 
             valA={`${outA.wins ?? 0}–${outA.losses ?? 0} / ${outA.tournaments ?? 0}`}
             valB={`${outB.wins ?? 0}–${outB.losses ?? 0} / ${outB.tournaments ?? 0}`}
           />
-          {expanded?.tournamentsBothAttended != null ? (
-            <StatRow
-              label="Shared Brackets"
-              valA={expanded.tournamentsBothAttended.length}
-              valB={expanded.tournamentsBothAttended.length}
-            />
+          {tournaments.length > 0 ? (
+            <StatRow label="Tournaments" valA={tourneyCountA} valB={tourneyCountB} />
           ) : null}
         </tbody>
       </table>
 
-      {expanded?.sharedWins?.length > 0 ? (
-        <CollapsibleSection title={`Common opponents both beat (${expanded.sharedWins.length})`} defaultOpen>
-          <table className="compare-opp-table">
-            <thead>
-              <tr><th>Opponent</th><th>{pA} W–L</th><th>{pB} W–L</th><th>Opp ELO</th></tr>
-            </thead>
-            <tbody>
-              {expanded.sharedWins.map(r => (
-                <tr key={r.opponent}>
-                  <td>{r.opponent}</td>
-                  <td>{r.p1Wins}–{r.p1Losses}</td>
-                  <td>{r.p2Wins}–{r.p2Losses}</td>
-                  <td>{r.oppElo}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </CollapsibleSection>
-      ) : null}
+      <OpponentRecordSection
+        label="Has Beaten"
+        rows={hasBeaten}
+        pA={pA}
+        pB={pB}
+        commonMode="wins"
+      />
 
-      {expanded?.sharedLosses?.length > 0 ? (
-        <CollapsibleSection title={`Common opponents both lost to (${expanded.sharedLosses.length})`} defaultOpen>
-          <table className="compare-opp-table">
-            <thead>
-              <tr><th>Opponent</th><th>{pA} W–L</th><th>{pB} W–L</th><th>Opp ELO</th></tr>
-            </thead>
-            <tbody>
-              {expanded.sharedLosses.map(r => (
-                <tr key={r.opponent}>
-                  <td>{r.opponent}</td>
-                  <td>{r.p1Wins}–{r.p1Losses}</td>
-                  <td>{r.p2Wins}–{r.p2Losses}</td>
-                  <td>{r.oppElo}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </CollapsibleSection>
-      ) : null}
+      <OpponentRecordSection
+        label="Has Lost To"
+        rows={hasLostTo}
+        pA={pA}
+        pB={pB}
+        commonMode="losses"
+      />
 
-      {expanded?.tournamentsBothAttended?.length > 0 ? (
-        <CollapsibleSection title={`Shared brackets (${expanded.tournamentsBothAttended.length})`} defaultOpen>
-          <div className="compare-tourney-list">
-            {expanded.tournamentsBothAttended.map((t) => (
-              <div key={t.eventSlug || `${t.name}-${t.bracket}`} className="compare-tourney-row">
-                <div className="compare-tourney-name">
-                  {t.name}
-                  {t.bracket && t.bracket.toLowerCase() !== t.name?.toLowerCase() ? (
-                    <span className="compare-tourney-bracket"> · {t.bracket}</span>
-                  ) : null}
-                </div>
-                <div className="compare-tourney-detail">
-                  <span className="compare-player-a">{pA}</span>: {t.p1Place != null ? `#${t.p1Place}` : '—'} · {t.p1WL}
-                </div>
-                <div className="compare-tourney-detail">
-                  <span className="compare-player-b">{pB}</span>: {t.p2Place != null ? `#${t.p2Place}` : '—'} · {t.p2WL}
-                </div>
-              </div>
-            ))}
-          </div>
-        </CollapsibleSection>
-      ) : null}
-
-      <div className="compare-unique-wins-grid">
-        <UniqueWinsCol label={`${pA} unique wins`} items={expanded?.p1UniqueWins} playerClass="compare-player-a" />
-        <UniqueWinsCol label={`${pB} unique wins`} items={expanded?.p2UniqueWins} playerClass="compare-player-b" />
-      </div>
+      <TournamentCompareSection tournaments={tournaments} pA={pA} pB={pB} />
 
       <div className="compare-shared-lists-grid">
         <TagListCol title="Shared wins" items={card.shared_wins} />
@@ -1002,16 +988,21 @@ const ComparisonBody = memo(function ComparisonBody({ card, expanded, pA, pB }) 
         <TagListCol title={`${pB} unique losses`} items={card.unique_losses?.[pB]} />
       </div>
 
-      {(outA.notable_wins?.length > 0 || outB.notable_wins?.length > 0 || outA.notable_losses?.length > 0 || outB.notable_losses?.length > 0) ? (
-        <CollapsibleSection title="Out-of-Region Notable Results">
-          <div className="compare-oor-grid">
-            <OorCol label={`${pA} notable OOR wins`} items={outA.notable_wins} />
-            <OorCol label={`${pB} notable OOR wins`} items={outB.notable_wins} />
-            <OorCol label={`${pA} notable OOR losses`} items={outA.notable_losses} />
-            <OorCol label={`${pB} notable OOR losses`} items={outB.notable_losses} />
-          </div>
-        </CollapsibleSection>
-      ) : null}
+      <OpponentRecordSection
+        label="OOR Has Beaten"
+        rows={hasBeatenOOR}
+        pA={pA}
+        pB={pB}
+        commonMode="wins"
+      />
+
+      <OpponentRecordSection
+        label="OOR Has Lost To"
+        rows={hasLostToOOR}
+        pA={pA}
+        pB={pB}
+        commonMode="losses"
+      />
     </div>
   )
 })
@@ -1034,23 +1025,663 @@ function CollapsibleSection({ title, defaultOpen = false, children }) {
   )
 }
 
-function UniqueWinsCol({ label, items, playerClass }) {
-  if (!items || items.length === 0) return null
+/**
+ * Unified Has Beaten / Has Lost To table with optional common-opponents filter.
+ * commonMode "wins" = both beat them; "losses" = both lost to them.
+ */
+function OpponentRecordSection({ label, rows, pA, pB, commonMode }) {
+  const [commonOnly, setCommonOnly] = useState(false)
+  const visible = useMemo(() => {
+    if (!commonOnly) return rows
+    return rows.filter((r) => isCommonOpponent(r, commonMode))
+  }, [rows, commonOnly, commonMode])
+
+  if (!rows.length) return null
+
   return (
-    <div className="compare-unique-col">
-      <h4 className={`compare-unique-title ${playerClass}`}>{label}</h4>
-      <table className="compare-opp-table compare-opp-table--sm">
-        <thead><tr><th>Opponent</th><th>W–L</th><th>Opp ELO</th></tr></thead>
-        <tbody>
-          {items.map(r => (
-            <tr key={r.opponent}>
-              <td>{r.opponent}</td>
-              <td>{r.wins}–{r.losses}</td>
-              <td>{r.oppElo}</td>
+    <CollapsibleSection title={`${label} (${visible.length})`} defaultOpen>
+      <label className="compare-common-filter">
+        <input
+          type="checkbox"
+          checked={commonOnly}
+          onChange={(e) => setCommonOnly(e.target.checked)}
+        />
+        Common opponents only
+      </label>
+      {visible.length === 0 ? (
+        <p className="compare-opp-empty">No common opponents.</p>
+      ) : (
+        <table className="compare-opp-table">
+          <thead>
+            <tr>
+              <th>Opponent</th>
+              <th className="compare-player-a">{pA}</th>
+              <th className="compare-player-b">{pB}</th>
+              <th>Opp ELO</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {visible.map((r) => {
+              const p1Missing = r.p1Wins == null
+              const p2Missing = r.p2Wins == null
+              const uniqueStar = p1Missing !== p2Missing
+                ? (p1Missing ? 'b' : 'a')
+                : null
+              const edge = (!p1Missing && !p2Missing)
+                ? recordEdge(r.p1Wins, r.p1Losses, r.p2Wins, r.p2Losses)
+                : null
+              const rowClass = edge === 'a'
+                ? 'compare-opp-row--a'
+                : edge === 'b'
+                  ? 'compare-opp-row--b'
+                  : ''
+              return (
+                <tr key={r.opponent} className={rowClass}>
+                  <td>
+                    {uniqueStar ? (
+                      <span
+                        className={`compare-unique-star compare-unique-star--${uniqueStar}`}
+                        title={uniqueStar === 'a' ? `${pA} only` : `${pB} only`}
+                        aria-label={uniqueStar === 'a' ? `${pA} only` : `${pB} only`}
+                      >
+                        ★
+                      </span>
+                    ) : null}
+                    {r.opponent}
+                  </td>
+                  <td>{p1Missing ? '--' : `${r.p1Wins}–${r.p1Losses}`}</td>
+                  <td>{p2Missing ? '--' : `${r.p2Wins}–${r.p2Losses}`}</td>
+                  <td>{r.oppElo}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      )}
+    </CollapsibleSection>
+  )
+}
+
+function isCommonOpponent(r, commonMode) {
+  if (commonMode === 'losses') {
+    return (r.p1Losses ?? 0) > 0 && (r.p2Losses ?? 0) > 0
+  }
+  return (r.p1Wins ?? 0) > 0 && (r.p2Wins ?? 0) > 0
+}
+
+/** Better record = more wins; if tied wins, fewer losses. Returns 'a' | 'b' | null (tie). */
+function recordEdge(w1, l1, w2, l2) {
+  if (w1 !== w2) return w1 > w2 ? 'a' : 'b'
+  if (l1 !== l2) return l1 < l2 ? 'a' : 'b'
+  return null
+}
+
+/** Prefer API hasBeaten; fall back to merging legacy shared/unique win lists. */
+function resolveHasBeaten(expanded) {
+  if (!expanded) return []
+  if (Array.isArray(expanded.hasBeaten)) {
+    return expanded.hasBeaten
+  }
+  const byOpp = new Map()
+  for (const r of expanded.sharedWins || []) {
+    byOpp.set(r.opponent, {
+      opponent: r.opponent,
+      p1Wins: r.p1Wins,
+      p1Losses: r.p1Losses,
+      p2Wins: r.p2Wins,
+      p2Losses: r.p2Losses,
+      oppElo: r.oppElo,
+    })
+  }
+  for (const r of expanded.p1UniqueWins || []) {
+    byOpp.set(r.opponent, {
+      opponent: r.opponent,
+      p1Wins: r.wins,
+      p1Losses: r.losses,
+      p2Wins: null,
+      p2Losses: null,
+      oppElo: r.oppElo,
+    })
+  }
+  for (const r of expanded.p2UniqueWins || []) {
+    byOpp.set(r.opponent, {
+      opponent: r.opponent,
+      p1Wins: null,
+      p1Losses: null,
+      p2Wins: r.wins,
+      p2Losses: r.losses,
+      oppElo: r.oppElo,
+    })
+  }
+  return [...byOpp.values()].sort((a, b) => (b.oppElo ?? 0) - (a.oppElo ?? 0))
+}
+
+/** Prefer API hasLostTo; fall back to sharedLosses (common only). */
+function resolveHasLostTo(expanded) {
+  if (!expanded) return []
+  if (Array.isArray(expanded.hasLostTo)) {
+    return expanded.hasLostTo
+  }
+  return (expanded.sharedLosses || []).map((r) => ({
+    opponent: r.opponent,
+    p1Wins: r.p1Wins,
+    p1Losses: r.p1Losses,
+    p2Wins: r.p2Wins,
+    p2Losses: r.p2Losses,
+    oppElo: r.oppElo,
+  }))
+}
+
+/** Merge notable OOR [name, count] lists into per-opponent win/loss maps. */
+function notableListsToRecords(winsList, lossesList) {
+  const byOpp = new Map()
+  for (const item of winsList || []) {
+    const name = Array.isArray(item) ? item[0] : String(item)
+    const count = Array.isArray(item) ? (Number(item[1]) || 1) : 1
+    if (!name) continue
+    const rec = byOpp.get(name) || { wins: 0, losses: 0 }
+    rec.wins += count
+    byOpp.set(name, rec)
+  }
+  for (const item of lossesList || []) {
+    const name = Array.isArray(item) ? item[0] : String(item)
+    const count = Array.isArray(item) ? (Number(item[1]) || 1) : 1
+    if (!name) continue
+    const rec = byOpp.get(name) || { wins: 0, losses: 0 }
+    rec.losses += count
+    byOpp.set(name, rec)
+  }
+  return byOpp
+}
+
+function mergeOorRecordTables(recA, recB, mode) {
+  const names = new Set([...recA.keys(), ...recB.keys()])
+  const rows = []
+  for (const opponent of names) {
+    const a = recA.get(opponent)
+    const b = recB.get(opponent)
+    const aWins = a?.wins ?? 0
+    const aLosses = a?.losses ?? 0
+    const bWins = b?.wins ?? 0
+    const bLosses = b?.losses ?? 0
+    if (mode === 'wins' && aWins <= 0 && bWins <= 0) continue
+    if (mode === 'losses' && aLosses <= 0 && bLosses <= 0) continue
+    const aPlayed = aWins > 0 || aLosses > 0
+    const bPlayed = bWins > 0 || bLosses > 0
+    rows.push({
+      opponent,
+      p1Wins: aPlayed ? aWins : null,
+      p1Losses: aPlayed ? aLosses : null,
+      p2Wins: bPlayed ? bWins : null,
+      p2Losses: bPlayed ? bLosses : null,
+      oppElo: null,
+    })
+  }
+  return rows.sort((x, y) => String(x.opponent).localeCompare(String(y.opponent)))
+}
+
+function resolveHasBeatenOOR(expanded, card, pA, pB) {
+  if (Array.isArray(expanded?.hasBeatenOOR)) return expanded.hasBeatenOOR
+  const outA = card?.out_region_summary?.[pA] || {}
+  const outB = card?.out_region_summary?.[pB] || {}
+  return mergeOorRecordTables(
+    notableListsToRecords(outA.notable_wins, outA.notable_losses),
+    notableListsToRecords(outB.notable_wins, outB.notable_losses),
+    'wins',
+  )
+}
+
+function resolveHasLostToOOR(expanded, card, pA, pB) {
+  if (Array.isArray(expanded?.hasLostToOOR)) return expanded.hasLostToOOR
+  const outA = card?.out_region_summary?.[pA] || {}
+  const outB = card?.out_region_summary?.[pB] || {}
+  return mergeOorRecordTables(
+    notableListsToRecords(outA.notable_wins, outA.notable_losses),
+    notableListsToRecords(outB.notable_wins, outB.notable_losses),
+    'losses',
+  )
+}
+
+/**
+ * Prefer API tournamentsAttended (union of in-region + OOR with set runs).
+ * Legacy tournamentsBothAttended is shared-only and has no sets — avoid using it
+ * as a silent stand-in for the full list.
+ */
+function resolveTournamentsAttended(expanded) {
+  if (!expanded) return []
+  if (Array.isArray(expanded.tournamentsAttended)) {
+    return expanded.tournamentsAttended
+  }
+  return []
+}
+
+function formatPlacement(n) {
+  if (n == null || n === '') return '--'
+  const num = Number(n)
+  if (!Number.isFinite(num)) return '--'
+  const j = num % 10
+  const k = num % 100
+  let suf = 'TH'
+  if (j === 1 && k !== 11) suf = 'ST'
+  else if (j === 2 && k !== 12) suf = 'ND'
+  else if (j === 3 && k !== 13) suf = 'RD'
+  return `${num}${suf}`
+}
+
+function formatTourneysDate(startAt) {
+  if (!startAt) return ''
+  try {
+    return new Date(startAt * 1000).toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: '2-digit',
+    })
+  } catch {
+    return ''
+  }
+}
+
+function tourneyRegionBadges(t, side = 'both') {
+  const regions = new Set()
+  if (side !== 'b' && t.p1?.region) regions.add(t.p1.region)
+  if (side !== 'a' && t.p2?.region) regions.add(t.p2.region)
+  if (regions.size === 0) return null
+  return (
+    <>
+      {[...regions].map((region) => (
+        <span
+          key={region}
+          className={`compare-tourney-region compare-tourney-region--${region === 'out' ? 'oor' : 'in'}`}
+        >
+          {region === 'out' ? 'OOR' : 'In'}
+        </span>
+      ))}
+    </>
+  )
+}
+
+function tournamentSlugFromEventSlug(eventSlug) {
+  const parts = String(eventSlug || '').replace(/^\/+|\/+$/g, '').split('/')
+  if (parts[0] === 'tournament' && parts[1]) return `tournament/${parts[1]}`
+  return parts[0] ? parts.join('/') : ''
+}
+
+function isSharedTourney(t) {
+  return Boolean(t.shared || (t.p1 && t.p2))
+}
+
+const tournamentIconCache = new Map()
+
+function useTournamentIcons(tournaments) {
+  const seeded = useMemo(() => {
+    const next = {}
+    for (const t of tournaments) {
+      const slug = tournamentSlugFromEventSlug(t.eventSlug)
+      if (slug && t.iconUrl) {
+        next[slug] = t.iconUrl
+        tournamentIconCache.set(slug, t.iconUrl)
+      }
+    }
+    return next
+  }, [tournaments])
+  const [fetched, setFetched] = useState({})
+
+  useEffect(() => {
+    const slugs = [...new Set(
+      tournaments.map((t) => tournamentSlugFromEventSlug(t.eventSlug)).filter(Boolean),
+    )]
+    if (!slugs.length) return undefined
+    let cancelled = false
+
+    async function load() {
+      const collected = { ...seeded }
+      for (const slug of slugs) {
+        if (tournamentIconCache.has(slug) && collected[slug] == null) {
+          collected[slug] = tournamentIconCache.get(slug)
+        }
+      }
+      let pending = slugs.filter((slug) => !Object.prototype.hasOwnProperty.call(collected, slug))
+      if (!cancelled) setFetched({ ...collected })
+      while (pending.length && !cancelled) {
+        let data
+        try {
+          const res = await fetch('/api/tournament-icons', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slugs: pending }),
+          })
+          data = await res.json()
+        } catch {
+          break
+        }
+        const icons = data.icons || {}
+        for (const [slug, url] of Object.entries(icons)) {
+          tournamentIconCache.set(slug, url)
+          collected[slug] = url
+        }
+        if (!cancelled) setFetched({ ...collected })
+        const nextPending = (data.pending || []).filter(
+          (slug) => !Object.prototype.hasOwnProperty.call(collected, slug),
+        )
+        if (!nextPending.length || nextPending.length >= pending.length) break
+        pending = nextPending
+      }
+    }
+
+    load()
+    return () => { cancelled = true }
+  }, [tournaments, seeded])
+
+  return { ...seeded, ...fetched }
+}
+
+function TourneyIcon({ name, iconUrl }) {
+  const initial = (name || '?').trim().charAt(0).toUpperCase() || 'T'
+  if (iconUrl) {
+    return <img src={iconUrl} alt="" className="compare-tourney-icon" />
+  }
+  return <div className="compare-tourney-icon fallback" aria-hidden="true">{initial}</div>
+}
+
+function TourneyPlace({ sideData, align, uniqueStar, uniqueLabel }) {
+  return (
+    <div className={`compare-tourney-place compare-tourney-place--${align}`}>
+      {sideData ? (
+        <>
+          <span className="compare-tourney-place-main">
+            {uniqueStar ? (
+              <span
+                className={`compare-unique-star compare-unique-star--${uniqueStar}`}
+                title={uniqueLabel}
+                aria-label={uniqueLabel}
+              >
+                ★
+              </span>
+            ) : null}
+            <span className="compare-tourney-place-num">{formatPlacement(sideData.place)}</span>
+          </span>
+          <span className="compare-tourney-place-wl">{sideData.wins}–{sideData.losses}</span>
+        </>
+      ) : (
+        <span className="compare-tourney-place-missing">--</span>
+      )}
+    </div>
+  )
+}
+
+/** Better placement = lower place number; W–L as tiebreaker. */
+function placementEdge(sideA, sideB) {
+  if (!sideA || !sideB) return null
+  const a = sideA.place
+  const b = sideB.place
+  if (a == null && b == null) {
+    return recordEdge(sideA.wins ?? 0, sideA.losses ?? 0, sideB.wins ?? 0, sideB.losses ?? 0)
+  }
+  if (a == null) return 'b'
+  if (b == null) return 'a'
+  if (a !== b) return a < b ? 'a' : 'b'
+  return recordEdge(sideA.wins ?? 0, sideA.losses ?? 0, sideB.wins ?? 0, sideB.losses ?? 0)
+}
+
+function TournamentCompareSection({ tournaments, pA, pB }) {
+  const [commonOnly, setCommonOnly] = useState(false)
+  const [dateView, setDateView] = useState(false)
+  const icons = useTournamentIcons(tournaments)
+  const shared = useMemo(() => tournaments.filter(isSharedTourney), [tournaments])
+  const onlyA = useMemo(() => tournaments.filter((t) => t.p1 && !t.p2), [tournaments])
+  const onlyB = useMemo(() => tournaments.filter((t) => t.p2 && !t.p1), [tournaments])
+  const dateList = commonOnly ? shared : tournaments
+  const shownCount = (dateView || commonOnly) ? dateList.length : tournaments.length
+
+  if (!tournaments.length) return null
+
+  return (
+    <CollapsibleSection title={`Tournaments (${shownCount})`} defaultOpen>
+      <div className="compare-tourney-filters">
+        <label className="compare-common-filter">
+          <input
+            type="checkbox"
+            checked={commonOnly}
+            onChange={(e) => setCommonOnly(e.target.checked)}
+          />
+          Common tournaments only
+        </label>
+        <label className="compare-common-filter">
+          <input
+            type="checkbox"
+            checked={dateView}
+            onChange={(e) => setDateView(e.target.checked)}
+          />
+          Date view
+        </label>
+      </div>
+
+      {dateView ? (
+        dateList.length === 0 ? (
+          <p className="compare-opp-empty">{commonOnly ? 'No common tournaments.' : 'No tournaments.'}</p>
+        ) : (
+          <div className="compare-tourney-list">
+            {dateList.map((t) => (
+              <TournamentCompareRow
+                key={t.eventSlug || `${t.name}-${t.bracket}`}
+                t={t}
+                pA={pA}
+                pB={pB}
+                side="both"
+                blankMissing
+                iconUrl={icons[tournamentSlugFromEventSlug(t.eventSlug)]}
+              />
+            ))}
+          </div>
+        )
+      ) : (
+        <>
+          <section className="compare-tourney-shared" aria-label="Common tournaments">
+            <h4 className="compare-tourney-col-title">Common tournaments ({shared.length})</h4>
+            {shared.length === 0 ? (
+              <p className="compare-opp-empty">No common tournaments.</p>
+            ) : (
+              <div className="compare-tourney-list">
+                {shared.map((t) => (
+                  <TournamentCompareRow
+                    key={t.eventSlug || `${t.name}-${t.bracket}`}
+                    t={t}
+                    pA={pA}
+                    pB={pB}
+                    side="both"
+                    iconUrl={icons[tournamentSlugFromEventSlug(t.eventSlug)]}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          {!commonOnly ? (
+            <div className="compare-tourney-columns">
+              <section className="compare-tourney-col compare-tourney-col--a" aria-label={`${pA} tournaments`}>
+                <h4 className="compare-tourney-col-title compare-player-a">{pA}</h4>
+                {onlyA.length === 0 ? (
+                  <p className="compare-opp-empty">No unique tournaments.</p>
+                ) : (
+                  <div className="compare-tourney-list">
+                    {onlyA.map((t) => (
+                      <TournamentCompareRow
+                        key={t.eventSlug || `${t.name}-${t.bracket}`}
+                        t={t}
+                        pA={pA}
+                        pB={pB}
+                        side="a"
+                        iconUrl={icons[tournamentSlugFromEventSlug(t.eventSlug)]}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+              <section className="compare-tourney-col compare-tourney-col--b" aria-label={`${pB} tournaments`}>
+                <h4 className="compare-tourney-col-title compare-player-b">{pB}</h4>
+                {onlyB.length === 0 ? (
+                  <p className="compare-opp-empty">No unique tournaments.</p>
+                ) : (
+                  <div className="compare-tourney-list">
+                    {onlyB.map((t) => (
+                      <TournamentCompareRow
+                        key={t.eventSlug || `${t.name}-${t.bracket}`}
+                        t={t}
+                        pA={pA}
+                        pB={pB}
+                        side="b"
+                        iconUrl={icons[tournamentSlugFromEventSlug(t.eventSlug)]}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+            </div>
+          ) : null}
+        </>
+      )}
+    </CollapsibleSection>
+  )
+}
+
+function TournamentCompareRow({ t, pA, pB, side = 'both', iconUrl, blankMissing = false }) {
+  const [open, setOpen] = useState(false)
+  const solo = side !== 'both'
+  const uniqueStar = blankMissing && Boolean(t.p1) !== Boolean(t.p2)
+    ? (t.p1 ? 'a' : 'b')
+    : null
+  const edge = (!solo && t.p1 && t.p2) ? placementEdge(t.p1, t.p2) : null
+  const rowClass = [
+    'compare-tourney-card',
+    open ? 'compare-tourney-card--open' : '',
+    solo && side === 'a' ? 'compare-tourney-card--a' : '',
+    solo && side === 'b' ? 'compare-tourney-card--b' : '',
+    !solo && edge === 'a' ? 'compare-tourney-card--a' : '',
+    !solo && edge === 'b' ? 'compare-tourney-card--b' : '',
+    blankMissing && uniqueStar === 'a' ? 'compare-tourney-card--a' : '',
+    blankMissing && uniqueStar === 'b' ? 'compare-tourney-card--b' : '',
+  ].filter(Boolean).join(' ')
+  const dateLabel = formatTourneysDate(t.startAt)
+  const bracketLabel = t.bracket && t.bracket.toLowerCase() !== t.name?.toLowerCase()
+    ? t.bracket
+    : null
+  const regionBadges = tourneyRegionBadges(t, side)
+  const showP1 = side !== 'b'
+  const showP2 = side !== 'a'
+
+  return (
+    <div className={rowClass}>
+      <button
+        type="button"
+        className={`compare-tourney-header${solo ? ' compare-tourney-header--solo' : ''}`}
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        {showP1 && !solo ? (
+          <TourneyPlace
+            sideData={t.p1}
+            align="a"
+            uniqueStar={uniqueStar === 'a' ? 'a' : null}
+            uniqueLabel={uniqueStar === 'a' ? `${pA} only` : undefined}
+          />
+        ) : null}
+
+        <div className="compare-tourney-mid">
+          <div className="compare-tourney-title-wrap">
+            <TourneyIcon name={t.name} iconUrl={iconUrl} />
+            <div className="compare-tourney-title-block">
+              <h3 className="compare-tourney-title">{t.name}</h3>
+              {bracketLabel ? (
+                <p className="compare-tourney-meta">
+                  <span>Event:</span> {bracketLabel}
+                </p>
+              ) : null}
+              {dateLabel ? (
+                <p className="compare-tourney-meta">
+                  <span>Date:</span> {dateLabel}
+                </p>
+              ) : null}
+              {regionBadges ? (
+                <p className="compare-tourney-meta compare-tourney-meta--badges">{regionBadges}</p>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        {solo ? <TourneyPlace sideData={side === 'a' ? t.p1 : t.p2} align="b" /> : null}
+        {showP2 && !solo ? (
+          <TourneyPlace
+            sideData={t.p2}
+            align="b"
+            uniqueStar={uniqueStar === 'b' ? 'b' : null}
+            uniqueLabel={uniqueStar === 'b' ? `${pB} only` : undefined}
+          />
+        ) : null}
+
+        <span className="compare-tourney-expand" aria-hidden="true">{open ? '−' : '+'}</span>
+      </button>
+
+      {open ? (
+        <div className={`compare-tourney-runs${solo && !blankMissing ? ' compare-tourney-runs--solo' : ''}`}>
+          {showP1 && (t.p1 || blankMissing) ? (
+            <TournamentRunCol label={pA} playerClass="compare-player-a" side={t.p1} />
+          ) : null}
+          {showP2 && (t.p2 || blankMissing) ? (
+            <TournamentRunCol label={pB} playerClass="compare-player-b" side={t.p2} />
+          ) : null}
+          {!blankMissing && !((showP1 && t.p1) || (showP2 && t.p2)) ? (
+            <p className="compare-opp-empty">No run data.</p>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function TournamentRunCol({ label, playerClass, side }) {
+  if (!side) {
+    return (
+      <div className="compare-tourney-run compare-tourney-run--empty">
+        <div className={`compare-tourney-run-label ${playerClass}`}>{label}</div>
+      </div>
+    )
+  }
+  const sets = side.sets || []
+  return (
+    <div className="compare-tourney-run">
+      <div className={`compare-tourney-run-label ${playerClass}`}>{label}</div>
+      {sets.length === 0 ? (
+        <p className="compare-opp-empty">No sets recorded.</p>
+      ) : (
+        <ul className="compare-set-list">
+          {sets.map((s, i) => {
+            const hasScore = s.playerScore != null && s.opponentScore != null
+            return (
+              <li
+                key={s.setId || `${s.opponent}-${i}`}
+                className={`compare-set-row ${s.won ? 'compare-set-row--win' : 'compare-set-row--loss'}`}
+              >
+                <span className="compare-set-result">{s.won ? 'W' : 'L'}</span>
+                <span className="compare-set-opponent">{s.opponent}</span>
+                <span className="compare-set-score">
+                  {hasScore ? (
+                    <>
+                      <span className={`compare-set-box ${s.won ? 'compare-set-box--win' : ''}`}>
+                        {s.playerScore}
+                      </span>
+                      <span className={`compare-set-box ${s.won ? '' : 'compare-set-box--loss'}`}>
+                        {s.opponentScore}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="compare-set-score-missing">--</span>
+                  )}
+                </span>
+              </li>
+            )
+          })}
+        </ul>
+      )}
     </div>
   )
 }
@@ -1071,18 +1702,3 @@ function TagListCol({ title, items }) {
   )
 }
 
-function OorCol({ label, items }) {
-  if (!items || items.length === 0) return null
-  return (
-    <div className="compare-oor-col">
-      <h5 className="compare-oor-title">{label}</h5>
-      <ul className="compare-oor-items">
-        {items.map((item, i) => {
-          const name = Array.isArray(item) ? item[0] : String(item)
-          const count = Array.isArray(item) ? item[1] : null
-          return <li key={i}>{name}{count != null ? ` (${count})` : ''}</li>
-        })}
-      </ul>
-    </div>
-  )
-}
